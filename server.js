@@ -21,10 +21,12 @@ app.use(express.static('public'));
 //     currentTime: 0,
 //     isPlaying: false,
 //     users: Map<socketId, nombre>
+//     messages: [{ name, text, ts, system }]
 //   }
 // }
 // -----------------------------------------------------------------
 const rooms = {};
+const MAX_MESSAGES = 50;
 
 function sanitizeRoomId(raw) {
   return String(raw || '')
@@ -46,8 +48,15 @@ function getPublicRoomState(room) {
     videoUrl: room.videoUrl,
     currentTime: room.currentTime,
     isPlaying: room.isPlaying,
-    userCount: room.users.size
+    userCount: room.users.size,
+    messages: room.messages
   };
+}
+
+function pushMessage(room, roomId, message) {
+  room.messages.push(message);
+  if (room.messages.length > MAX_MESSAGES) room.messages.shift();
+  io.to(roomId).emit('chat-message', message);
 }
 
 io.on('connection', (socket) => {
@@ -64,7 +73,8 @@ io.on('connection', (socket) => {
         videoUrl: '',
         currentTime: 0,
         isPlaying: false,
-        users: new Map()
+        users: new Map(),
+        messages: []
       };
     } else if (room.password && room.password !== String(password || '')) {
       // La sala existe y tiene contraseña que no coincide
@@ -74,14 +84,37 @@ io.on('connection', (socket) => {
 
     socket.join(id);
     socket.data.roomId = id;
-    socket.data.displayName = displayName || 'Invitado';
+    socket.data.displayName = String(displayName || 'Invitado').slice(0, 20);
     room.users.set(socket.id, socket.data.displayName);
 
-    // Le mandamos al que se une el estado actual de la sala para que arranque sincronizado
+    // Le mandamos al que se une el estado actual de la sala (video + historial de chat)
     socket.emit('joined-room', { roomId: id, hasPassword: !!room.password, state: getPublicRoomState(room) });
 
     // Avisamos a todos (incluido el nuevo) cuántos usuarios hay ahora
     io.to(id).emit('user-count', room.users.size);
+
+    // Mensaje de sistema para los que ya estaban en la sala
+    socket.to(id).emit('chat-message', {
+      name: 'Sistema', system: true, ts: Date.now(),
+      text: `${socket.data.displayName} se unió a la sala.`
+    });
+  });
+
+  // Chat de la sala
+  socket.on('chat-message', (text) => {
+    const id = socket.data.roomId;
+    const room = rooms[id];
+    if (!room) return;
+
+    const clean = String(text || '').trim().slice(0, 500);
+    if (!clean) return;
+
+    pushMessage(room, id, {
+      name: socket.data.displayName || 'Invitado',
+      text: clean,
+      ts: Date.now(),
+      system: false
+    });
   });
 
   // Reproducir / Pausar / Buscar (seek)
@@ -109,6 +142,14 @@ io.on('connection', (socket) => {
     io.to(id).emit('video-url-changed', url);
   });
 
+  // El cliente puede pedir el estado actual en cualquier momento (botón "Sincronizar")
+  socket.on('request-sync', () => {
+    const id = socket.data.roomId;
+    const room = rooms[id];
+    if (!room) return;
+    socket.emit('force-sync', getPublicRoomState(room));
+  });
+
   socket.on('disconnect', () => {
     const id = socket.data.roomId;
     const room = rooms[id];
@@ -116,6 +157,13 @@ io.on('connection', (socket) => {
 
     room.users.delete(socket.id);
     io.to(id).emit('user-count', room.users.size);
+
+    if (room.users.size > 0) {
+      io.to(id).emit('chat-message', {
+        name: 'Sistema', system: true, ts: Date.now(),
+        text: `${socket.data.displayName || 'Alguien'} salió de la sala.`
+      });
+    }
 
     // Si la sala queda vacía, la borramos para no acumular memoria
     if (room.users.size === 0) {

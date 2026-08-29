@@ -63,24 +63,39 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M17 20c0-2.8-2.24-5-5-5s-5 2.2-5 5M12 12a4 4 0 100-8 4 4 0 000 8z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span id="user-count-value">1</span>
         </span>
+        <button id="btn-sync" class="btn-ghost" title="Forzar re-sincronización con la sala">Sincronizar</button>
         <button id="btn-copy-link" class="btn-ghost">Copiar link de invitación</button>
         <button id="btn-leave" class="btn-ghost btn-danger">Salir</button>
       </div>
     </header>
 
-    <section class="video-wrap">
-      <video id="video-player" controls playsinline></video>
-      <div id="youtube-player" class="youtube-player hidden"></div>
-      <div class="video-placeholder" id="video-placeholder">
-        <p>Todavía no cargaron ningún video.</p>
-        <p class="sub">Pegá un link de YouTube, o uno directo .mp4 / .m3u8, para empezar.</p>
-      </div>
-    </section>
+    <div class="room-body">
+      <div class="main-column">
+        <section class="video-wrap">
+          <video id="video-player" controls playsinline></video>
+          <div id="youtube-player" class="youtube-player hidden"></div>
+          <div class="video-placeholder" id="video-placeholder">
+            <p>Todavía no cargaron ningún video.</p>
+            <p class="sub">Pegá un link de YouTube, o uno directo .mp4 / .m3u8, para empezar.</p>
+          </div>
+          <button id="play-unlock" class="play-unlock hidden">▶ Tocá para sincronizar la reproducción</button>
+        </section>
 
-    <section class="video-url-bar">
-      <input type="text" id="input-video-url" placeholder="Pegá un link de YouTube o un video directo (.mp4 / .m3u8)">
-      <button id="btn-load-video" class="btn-primary btn-compact">Cargar para todos</button>
-    </section>
+        <section class="video-url-bar">
+          <input type="text" id="input-video-url" placeholder="Pegá un link de YouTube o un video directo (.mp4 / .m3u8)">
+          <button id="btn-load-video" class="btn-primary btn-compact">Cargar para todos</button>
+        </section>
+      </div>
+
+      <aside class="chat-panel">
+        <div class="chat-header">Chat de la sala</div>
+        <div class="chat-messages" id="chat-messages"></div>
+        <form id="chat-form" class="chat-form" autocomplete="off">
+          <input type="text" id="chat-input" placeholder="Escribí algo..." maxlength="500">
+          <button type="submit" class="chat-send" aria-label="Enviar">➤</button>
+        </form>
+      </aside>
+    </div>
 
     <p id="copy-toast" class="toast hidden">¡Link copiado!</p>
   </main>

@@ -23,8 +23,15 @@
   const videoPlaceholder = document.getElementById('video-placeholder');
   const inputVideoUrl = document.getElementById('input-video-url');
   const btnLoadVideo = document.getElementById('btn-load-video');
+  const playUnlockBtn = document.getElementById('play-unlock');
+  const btnSync = document.getElementById('btn-sync');
+
+  const chatMessages = document.getElementById('chat-messages');
+  const chatForm = document.getElementById('chat-form');
+  const chatInput = document.getElementById('chat-input');
 
   let currentRoomId = null;
+  let myDisplayName = 'Invitado';
   let isRemoteAction = false; // evita que un cambio remoto dispare un evento local en bucle
 
   // --- Soporte YouTube ---
@@ -91,15 +98,46 @@
     }
   }
 
-  // Cada pocos segundos, si hay algo reproduciéndose en YouTube, corrige el
-  // desfasaje entre dispositivos (la API de YouTube no avisa cuando alguien
-  // arrastra la barra de tiempo, así que esto compensa eso).
+  // Cada pocos segundos, si algo se está reproduciendo, corrige el desfasaje
+  // entre dispositivos (útil sobre todo para YouTube, que no avisa cuando
+  // alguien arrastra la barra de tiempo; y como red de seguridad general
+  // para links directos si el reloj interno del video se desincroniza).
   setInterval(() => {
-    if (isRemoteAction || playerMode !== 'youtube' || !ytPlayer || !ytPlayer.getPlayerState) return;
-    if (ytPlayer.getPlayerState() === YT.PlayerState.PLAYING) {
-      socket.emit('video-action', { action: 'sync', time: ytPlayer.getCurrentTime() });
+    if (isRemoteAction) return;
+    if (playerMode === 'youtube' && ytPlayer && ytPlayer.getPlayerState) {
+      if (ytPlayer.getPlayerState() === YT.PlayerState.PLAYING) {
+        socket.emit('video-action', { action: 'sync', time: ytPlayer.getCurrentTime() });
+      }
+    } else if (playerMode === 'direct' && !video.paused) {
+      socket.emit('video-action', { action: 'sync', time: video.currentTime });
     }
   }, 5000);
+
+  // --------------------------------------------------------------
+  // La causa más común de "a uno le arranca y al otro no": los
+  // navegadores bloquean video.play() si no viene justo después de
+  // un click del usuario en ESA pestaña. Cuando eso pasa, en vez de
+  // fallar en silencio, mostramos un botón para que la persona lo
+  // desbloquee con un solo toque.
+  // --------------------------------------------------------------
+  function attemptPlay() {
+    const result = video.play();
+    if (result && result.catch) {
+      result.catch(() => {
+        playUnlockBtn.classList.remove('hidden');
+      });
+    }
+  }
+
+  playUnlockBtn.addEventListener('click', () => {
+    isRemoteAction = true;
+    video.play().then(() => {
+      playUnlockBtn.classList.add('hidden');
+    }).catch(() => {});
+    setTimeout(() => { isRemoteAction = false; }, 500);
+  });
+
+  video.addEventListener('playing', () => playUnlockBtn.classList.add('hidden'));
 
   // --- Prefill desde ?sala=mi-sala en la URL ---
   const params = new URLSearchParams(window.location.search);
@@ -121,6 +159,7 @@
     const roomId = inputRoom.value.trim();
     const password = inputPassword.value;
     const displayName = inputName.value.trim() || 'Invitado';
+    myDisplayName = displayName;
 
     if (!roomId) return;
 
@@ -151,7 +190,20 @@
       setVideo(state.videoUrl, false, { time: state.currentTime || 0, isPlaying: state.isPlaying });
     }
     updateOrb(state.isPlaying);
+
+    chatMessages.innerHTML = '';
+    (state.messages || []).forEach(appendChatMessage);
   }
+
+  // El servidor responde a un pedido manual de re-sincronización (botón "Sincronizar")
+  socket.on('force-sync', (state) => {
+    applyRoomState(state);
+  });
+
+  btnSync.addEventListener('click', () => {
+    socket.emit('request-sync');
+    pulseOrb();
+  });
 
   // ============================================================
   // Contador de usuarios
@@ -163,12 +215,16 @@
   // ============================================================
   // Cargar / cambiar video (detecta YouTube vs. link directo)
   // ============================================================
+  let currentVideoUrl = null;
+
   function setVideo(url, announce, opts = {}) {
     const { time = 0, isPlaying = false } = opts;
     if (!url) return;
 
     videoPlaceholder.classList.add('hidden');
     const ytId = getYouTubeId(url);
+    const isSameUrl = url === currentVideoUrl;
+    currentVideoUrl = url;
 
     if (ytId) {
       playerMode = 'youtube';
@@ -177,20 +233,31 @@
       video.classList.add('hidden');
       youtubeContainer.classList.remove('hidden');
 
-      if (ytReady) createYtPlayer({ videoId: ytId, time, isPlaying });
-      else pendingYtLoad = { videoId: ytId, time, isPlaying };
+      if (isSameUrl && ytPlayer && ytPlayer.seekTo) {
+        // Ya está cargado este mismo video: solo corregimos tiempo/estado
+        isRemoteAction = true;
+        if (Math.abs(ytPlayer.getCurrentTime() - time) > 1) ytPlayer.seekTo(time, true);
+        if (isPlaying) ytPlayer.playVideo(); else ytPlayer.pauseVideo();
+        setTimeout(() => { isRemoteAction = false; }, 500);
+      } else if (ytReady) {
+        createYtPlayer({ videoId: ytId, time, isPlaying });
+      } else {
+        pendingYtLoad = { videoId: ytId, time, isPlaying };
+      }
     } else {
       playerMode = 'direct';
       if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
       youtubeContainer.classList.add('hidden');
       video.classList.remove('hidden');
 
-      video.src = url;
-      video.load();
       isRemoteAction = true;
-      if (time) video.currentTime = time;
-      if (isPlaying) video.play().catch(() => {});
-      setTimeout(() => { isRemoteAction = false; }, 400);
+      if (!isSameUrl) {
+        video.src = url;
+        video.load();
+      }
+      if (Math.abs(video.currentTime - time) > 1) video.currentTime = time;
+      if (isPlaying) attemptPlay(); else video.pause();
+      setTimeout(() => { isRemoteAction = false; }, 500);
     }
 
     if (announce) socket.emit('change-video', url);
@@ -241,7 +308,7 @@
     if (Math.abs(getPos() - time) > 1) setPos(time);
 
     if (action === 'play') {
-      if (isYt) ytPlayer.playVideo(); else video.play().catch(() => {});
+      if (isYt) ytPlayer.playVideo(); else attemptPlay();
       updateOrb(true);
     }
     if (action === 'pause') {
@@ -290,4 +357,36 @@
   btnLeave.addEventListener('click', () => {
     window.location.href = window.location.pathname;
   });
+
+  // ============================================================
+  // Chat de la sala
+  // ============================================================
+  chatForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = chatInput.value.trim();
+    if (!text) return;
+    socket.emit('chat-message', text);
+    chatInput.value = '';
+  });
+
+  socket.on('chat-message', appendChatMessage);
+
+  function appendChatMessage(msg) {
+    const div = document.createElement('div');
+    const isOwn = !msg.system && msg.name === myDisplayName;
+    div.className = 'chat-msg' + (msg.system ? ' system' : isOwn ? ' own' : '');
+
+    if (msg.system) {
+      div.textContent = msg.text;
+    } else {
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'chat-name';
+      nameSpan.textContent = msg.name + ':';
+      div.appendChild(nameSpan);
+      div.appendChild(document.createTextNode(msg.text));
+    }
+
+    chatMessages.appendChild(div);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
 })();
