@@ -19,12 +19,87 @@
   const copyToast = document.getElementById('copy-toast');
 
   const video = document.getElementById('video-player');
+  const youtubeContainer = document.getElementById('youtube-player');
   const videoPlaceholder = document.getElementById('video-placeholder');
   const inputVideoUrl = document.getElementById('input-video-url');
   const btnLoadVideo = document.getElementById('btn-load-video');
 
   let currentRoomId = null;
   let isRemoteAction = false; // evita que un cambio remoto dispare un evento local en bucle
+
+  // --- Soporte YouTube ---
+  let playerMode = 'none'; // 'none' | 'direct' | 'youtube'
+  let ytPlayer = null;
+  let ytReady = false;
+  let pendingYtLoad = null;
+
+  function getYouTubeId(url) {
+    try {
+      const u = new URL(url);
+      const host = u.hostname.replace(/^www\.|^m\./, '');
+      if (host === 'youtu.be') {
+        return u.pathname.slice(1).split('/')[0] || null;
+      }
+      if (host === 'youtube.com' || host === 'music.youtube.com') {
+        if (u.pathname === '/watch') return u.searchParams.get('v');
+        const shorts = u.pathname.match(/^\/shorts\/([^/?]+)/);
+        if (shorts) return shorts[1];
+        const embed = u.pathname.match(/^\/embed\/([^/?]+)/);
+        if (embed) return embed[1];
+      }
+    } catch { /* no era una URL válida */ }
+    return null;
+  }
+
+  window.onYouTubeIframeAPIReady = function () {
+    ytReady = true;
+    if (pendingYtLoad) {
+      createYtPlayer(pendingYtLoad);
+      pendingYtLoad = null;
+    }
+  };
+
+  function createYtPlayer({ videoId, time, isPlaying }) {
+    if (ytPlayer && ytPlayer.loadVideoById) {
+      isRemoteAction = true;
+      ytPlayer.loadVideoById(videoId, time || 0);
+      if (!isPlaying) setTimeout(() => ytPlayer.pauseVideo(), 300);
+      setTimeout(() => { isRemoteAction = false; }, 500);
+      return;
+    }
+    ytPlayer = new YT.Player('youtube-player', {
+      videoId,
+      playerVars: { rel: 0, modestbranding: 1, playsinline: 1 },
+      events: {
+        onReady: (e) => {
+          if (time) e.target.seekTo(time, true);
+          if (isPlaying) e.target.playVideo(); else e.target.pauseVideo();
+        },
+        onStateChange: onYtStateChange
+      }
+    });
+  }
+
+  function onYtStateChange(e) {
+    if (isRemoteAction || !window.YT) return;
+    if (e.data === YT.PlayerState.PLAYING) {
+      socket.emit('video-action', { action: 'play', time: ytPlayer.getCurrentTime() });
+      updateOrb(true);
+    } else if (e.data === YT.PlayerState.PAUSED) {
+      socket.emit('video-action', { action: 'pause', time: ytPlayer.getCurrentTime() });
+      updateOrb(false);
+    }
+  }
+
+  // Cada pocos segundos, si hay algo reproduciéndose en YouTube, corrige el
+  // desfasaje entre dispositivos (la API de YouTube no avisa cuando alguien
+  // arrastra la barra de tiempo, así que esto compensa eso).
+  setInterval(() => {
+    if (isRemoteAction || playerMode !== 'youtube' || !ytPlayer || !ytPlayer.getPlayerState) return;
+    if (ytPlayer.getPlayerState() === YT.PlayerState.PLAYING) {
+      socket.emit('video-action', { action: 'sync', time: ytPlayer.getCurrentTime() });
+    }
+  }, 5000);
 
   // --- Prefill desde ?sala=mi-sala en la URL ---
   const params = new URLSearchParams(window.location.search);
@@ -73,11 +148,7 @@
 
   function applyRoomState(state) {
     if (state.videoUrl) {
-      loadVideoSrc(state.videoUrl, false);
-      isRemoteAction = true;
-      video.currentTime = state.currentTime || 0;
-      if (state.isPlaying) video.play().catch(() => {});
-      setTimeout(() => { isRemoteAction = false; }, 400);
+      setVideo(state.videoUrl, false, { time: state.currentTime || 0, isPlaying: state.isPlaying });
     }
     updateOrb(state.isPlaying);
   }
@@ -90,19 +161,45 @@
   });
 
   // ============================================================
-  // Cargar / cambiar video
+  // Cargar / cambiar video (detecta YouTube vs. link directo)
   // ============================================================
-  function loadVideoSrc(url, announce) {
-    video.src = url;
-    video.load();
-    videoPlaceholder.classList.toggle('hidden', !!url);
+  function setVideo(url, announce, opts = {}) {
+    const { time = 0, isPlaying = false } = opts;
+    if (!url) return;
+
+    videoPlaceholder.classList.add('hidden');
+    const ytId = getYouTubeId(url);
+
+    if (ytId) {
+      playerMode = 'youtube';
+      video.pause();
+      video.removeAttribute('src');
+      video.classList.add('hidden');
+      youtubeContainer.classList.remove('hidden');
+
+      if (ytReady) createYtPlayer({ videoId: ytId, time, isPlaying });
+      else pendingYtLoad = { videoId: ytId, time, isPlaying };
+    } else {
+      playerMode = 'direct';
+      if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
+      youtubeContainer.classList.add('hidden');
+      video.classList.remove('hidden');
+
+      video.src = url;
+      video.load();
+      isRemoteAction = true;
+      if (time) video.currentTime = time;
+      if (isPlaying) video.play().catch(() => {});
+      setTimeout(() => { isRemoteAction = false; }, 400);
+    }
+
     if (announce) socket.emit('change-video', url);
   }
 
   btnLoadVideo.addEventListener('click', () => {
     const url = inputVideoUrl.value.trim();
     if (!url) return;
-    loadVideoSrc(url, true);
+    setVideo(url, true);
   });
 
   inputVideoUrl.addEventListener('keydown', (e) => {
@@ -110,7 +207,7 @@
   });
 
   socket.on('video-url-changed', (url) => {
-    loadVideoSrc(url, false);
+    setVideo(url, false);
   });
 
   // ============================================================
@@ -137,15 +234,23 @@
   socket.on('video-action', ({ action, time }) => {
     isRemoteAction = true;
 
-    if (Math.abs(video.currentTime - time) > 0.6) {
-      video.currentTime = time;
+    const isYt = playerMode === 'youtube' && ytPlayer && ytPlayer.getCurrentTime;
+    const getPos = () => (isYt ? ytPlayer.getCurrentTime() : video.currentTime);
+    const setPos = (t) => { if (isYt) ytPlayer.seekTo(t, true); else video.currentTime = t; };
+
+    if (Math.abs(getPos() - time) > 1) setPos(time);
+
+    if (action === 'play') {
+      if (isYt) ytPlayer.playVideo(); else video.play().catch(() => {});
+      updateOrb(true);
     }
+    if (action === 'pause') {
+      if (isYt) ytPlayer.pauseVideo(); else video.pause();
+      updateOrb(false);
+    }
+    if (action === 'seek' || action === 'sync') pulseOrb();
 
-    if (action === 'play') { video.play().catch(() => {}); updateOrb(true); }
-    if (action === 'pause') { video.pause(); updateOrb(false); }
-    if (action === 'seek') pulseOrb();
-
-    setTimeout(() => { isRemoteAction = false; }, 400);
+    setTimeout(() => { isRemoteAction = false; }, 500);
   });
 
   // ============================================================

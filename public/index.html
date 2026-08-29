@@ -70,14 +70,15 @@
 
     <section class="video-wrap">
       <video id="video-player" controls playsinline></video>
+      <div id="youtube-player" class="youtube-player hidden"></div>
       <div class="video-placeholder" id="video-placeholder">
         <p>Todavía no cargaron ningún video.</p>
-        <p class="sub">Pegá un link .mp4 o .m3u8 abajo para empezar.</p>
+        <p class="sub">Pegá un link de YouTube, o uno directo .mp4 / .m3u8, para empezar.</p>
       </div>
     </section>
 
     <section class="video-url-bar">
-      <input type="text" id="input-video-url" placeholder="Pegá el link directo del video (.mp4 o .m3u8)">
+      <input type="text" id="input-video-url" placeholder="Pegá un link de YouTube o un video directo (.mp4 / .m3u8)">
       <button id="btn-load-video" class="btn-primary btn-compact">Cargar para todos</button>
     </section>
 
@@ -85,6 +86,7 @@
   </main>
 
   <script src="/socket.io/socket.io.js"></script>
+  <script src="https://www.youtube.com/iframe_api"></script>
   <script src="/client.js"></script>
 </body>
 </html>
