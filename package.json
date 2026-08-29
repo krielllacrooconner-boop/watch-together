@@ -1,0 +1,20 @@
+{
+  "name": "watch-together",
+  "version": "1.0.0",
+  "description": "Salas de video sincronizadas en tiempo real (tipo Watch2Gether)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["socket.io", "sync", "video", "watch-party"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3"
+  }
+}

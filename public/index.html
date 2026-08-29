@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>SyncRoom — Videos sincronizados en tiempo real</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <!-- Fondo animado sutil -->
+  <div class="bg-grid"></div>
+  <div class="bg-glow"></div>
+
+  <!-- ============ PANTALLA 1: LANDING ============ -->
+  <main id="view-landing" class="view">
+    <div class="landing-card">
+      <div class="brand">
+        <span class="brand-orb"></span>
+        <h1>SyncRoom</h1>
+      </div>
+      <p class="tagline">Miren el mismo video, al mismo segundo, desde donde sea.</p>
+
+      <form id="form-join" autocomplete="off">
+        <label class="field">
+          <span>Nombre de sala</span>
+          <input type="text" id="input-room" placeholder="ej: viernes-de-anime" maxlength="40" required>
+        </label>
+
+        <label class="field">
+          <span>Contraseña <em>(opcional)</em></span>
+          <input type="password" id="input-password" placeholder="Dejalo vacío si no querés">
+        </label>
+
+        <label class="field">
+          <span>Tu nombre</span>
+          <input type="text" id="input-name" placeholder="¿Cómo te llamamos?" maxlength="20">
+        </label>
+
+        <button type="submit" class="btn-primary">
+          <span>Entrar a la sala</span>
+        </button>
+        <p id="join-error" class="error-msg"></p>
+      </form>
+
+      <p class="hint">Si la sala no existe, se crea sola. Si ya existe, entrás directo.</p>
+    </div>
+  </main>
+
+  <!-- ============ PANTALLA 2: SALA ============ -->
+  <main id="view-room" class="view hidden">
+    <header class="room-header">
+      <div class="room-id-chip">
+        <span class="sync-orb" id="sync-orb"></span>
+        <span class="room-id-label">SALA</span>
+        <span class="room-id-value" id="room-id-value">—</span>
+      </div>
+
+      <div class="room-actions">
+        <span class="user-count" id="user-count" title="Personas conectadas">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M17 20c0-2.8-2.24-5-5-5s-5 2.2-5 5M12 12a4 4 0 100-8 4 4 0 000 8z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span id="user-count-value">1</span>
+        </span>
+        <button id="btn-copy-link" class="btn-ghost">Copiar link de invitación</button>
+        <button id="btn-leave" class="btn-ghost btn-danger">Salir</button>
+      </div>
+    </header>
+
+    <section class="video-wrap">
+      <video id="video-player" controls playsinline></video>
+      <div class="video-placeholder" id="video-placeholder">
+        <p>Todavía no cargaron ningún video.</p>
+        <p class="sub">Pegá un link .mp4 o .m3u8 abajo para empezar.</p>
+      </div>
+    </section>
+
+    <section class="video-url-bar">
+      <input type="text" id="input-video-url" placeholder="Pegá el link directo del video (.mp4 o .m3u8)">
+      <button id="btn-load-video" class="btn-primary btn-compact">Cargar para todos</button>
+    </section>
+
+    <p id="copy-toast" class="toast hidden">¡Link copiado!</p>
+  </main>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/client.js"></script>
+</body>
+</html>
