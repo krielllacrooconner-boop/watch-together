@@ -1,12 +1,12 @@
 {
   "name": "watch-together",
   "version": "1.0.0",
-  "description": "Salas de video sincronizadas en tiempo real (tipo Watch2Gether)",
+  "description": "Salas de video sincronizadas en tiempo real con YouTube, MP4 y HLS",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": ["socket.io", "sync", "video", "watch-party"],
+  "keywords": ["socket.io", "sync", "video", "watch-party", "hls", "youtube"],
   "author": "",
   "license": "ISC",
   "type": "commonjs",

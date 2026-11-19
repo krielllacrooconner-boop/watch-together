@@ -1,107 +1,225 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
-<title>SyncRoom — Videos sincronizados en tiempo real</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#08090f">
+  <meta name="description" content="Salas de video sincronizadas en tiempo real. Miren juntos, desde donde sea.">
+  <title>SyncRoom — miren juntos, al mismo segundo</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%238b7cff'/%3E%3Cstop offset='1' stop-color='%232dd4bf'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='18' fill='%2308090f'/%3E%3Ccircle cx='32' cy='32' r='13' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='22' fill='none' stroke='url(%23g)' stroke-opacity='.4' stroke-width='2'/%3E%3C/svg%3E">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
-  <!-- Fondo animado sutil -->
-  <div class="bg-grid"></div>
-  <div class="bg-glow"></div>
+  <!-- Fondo ambiental -->
+  <div class="ambient" aria-hidden="true">
+    <span class="ambient-orb orb-a"></span>
+    <span class="ambient-orb orb-b"></span>
+    <span class="ambient-orb orb-c"></span>
+    <span class="ambient-grid"></span>
+  </div>
 
-  <!-- ============ PANTALLA 1: LANDING ============ -->
-  <main id="view-landing" class="view">
-    <div class="landing-card">
-      <div class="brand">
-        <span class="brand-orb"></span>
-        <h1>SyncRoom</h1>
-      </div>
-      <p class="tagline">Miren el mismo video, al mismo segundo, desde donde sea.</p>
+  <div id="connection-banner" class="connection-banner hidden" role="status">
+    <span class="mini-spinner"></span> Se perdió la conexión. Reconectando…
+  </div>
 
-      <form id="form-join" autocomplete="off">
-        <label class="field">
-          <span>Nombre de sala</span>
-          <input type="text" id="input-room" placeholder="ej: viernes-de-anime" maxlength="40" required>
-        </label>
+  <!-- ============================ LANDING ============================ -->
+  <main id="view-landing" class="view landing">
+    <div class="landing-inner">
+      <nav class="site-nav">
+        <div class="brand">
+          <span class="brand-mark"><span></span></span>
+          <span class="brand-name">sync<span>room</span></span>
+        </div>
+        <span class="live-note"><span class="live-dot"></span> Salas en vivo</span>
+      </nav>
 
-        <label class="field">
-          <span>Contraseña <em>(opcional)</em></span>
-          <input type="password" id="input-password" placeholder="Dejalo vacío si no querés">
-        </label>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">WATCH PARTY · SINCRONIZADA</p>
+          <h1>Tus videos, <span class="text-gradient">a un mismo ritmo.</span></h1>
+          <p class="hero-lead">
+            Creá una sala, pasá el link y miren juntos al mismo segundo.
+            Sin contar atrás, sin “esperá que estoy cargando”.
+          </p>
+          <ul class="features">
+            <li><span class="feature-ico">◈</span> Sincronización real milisegundo a milisegundo</li>
+            <li><span class="feature-ico">◈</span> YouTube, MP4 y streams HLS</li>
+            <li><span class="feature-ico">◈</span> Chat en vivo y pantalla completa</li>
+          </ul>
+        </div>
 
-        <label class="field">
-          <span>Tu nombre</span>
-          <input type="text" id="input-name" placeholder="¿Cómo te llamamos?" maxlength="20">
-        </label>
+        <div class="hero-card">
+          <div class="card-top">
+            <span class="card-top-dot"></span>
+            <span>Entrar a una sala</span>
+            <span class="card-top-tag">GRATIS</span>
+          </div>
 
-        <button type="submit" class="btn-primary">
-          <span>Entrar a la sala</span>
-        </button>
-        <p id="join-error" class="error-msg"></p>
-      </form>
+          <form id="form-join" autocomplete="off">
+            <label class="field">
+              <span>Nombre de sala</span>
+              <input type="text" id="input-room" placeholder="ej: viernes-de-anime" maxlength="40" required spellcheck="false">
+            </label>
 
-      <p class="hint">Si la sala no existe, se crea sola. Si ya existe, entrás directo.</p>
+            <label class="field">
+              <span>Contraseña <em>(opcional)</em></span>
+              <input type="password" id="input-password" placeholder="Solo si la sala es privada" maxlength="100">
+            </label>
+
+            <label class="field">
+              <span>Tu nombre</span>
+              <input type="text" id="input-name" placeholder="¿Cómo te llamamos?" maxlength="24">
+            </label>
+
+            <button type="submit" class="btn-primary">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span>Entrar a la sala</span>
+            </button>
+            <button type="button" id="btn-random-room" class="btn-secondary">Crear sala al azar</button>
+            <p id="join-error" class="error-msg" role="alert"></p>
+          </form>
+
+          <p class="card-hint">Si la sala no existe, se crea sola. Podés compartir el link con quien quieras.</p>
+        </div>
+      </section>
+
+      <footer class="site-footer">
+        <span>Hecho para mirar juntos, estén donde estén.</span>
+        <span class="footer-key">Tip: en la sala, <kbd>F</kbd> = pantalla completa · <kbd>T</kbd> = modo cine</span>
+      </footer>
     </div>
   </main>
 
-  <!-- ============ PANTALLA 2: SALA ============ -->
-  <main id="view-room" class="view hidden">
-    <header class="room-header">
-      <div class="room-id-chip">
-        <span class="sync-orb" id="sync-orb"></span>
-        <span class="room-id-label">SALA</span>
-        <span class="room-id-value" id="room-id-value">—</span>
+  <!-- ============================= SALA ============================= -->
+  <main id="view-room" class="view room-view hidden">
+    <header class="topbar" id="topbar">
+      <div class="topbar-left">
+        <button id="btn-leave" class="icon-btn" title="Salir de la sala" aria-label="Salir de la sala">
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+
+        <div class="room-chip" title="Nombre de la sala">
+          <span id="sync-orb" class="sync-orb"></span>
+          <span class="room-chip-label">SALA</span>
+          <strong id="room-id-value">—</strong>
+        </div>
+
+        <span id="sync-status" class="sync-status">Conectando…</span>
       </div>
 
-      <div class="room-actions">
-        <span class="user-count" id="user-count" title="Personas conectadas">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M17 20c0-2.8-2.24-5-5-5s-5 2.2-5 5M12 12a4 4 0 100-8 4 4 0 000 8z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div class="topbar-right">
+        <div id="avatars" class="avatars" aria-label="Personas en la sala"></div>
+        <span class="user-count" title="Personas conectadas">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M16 20c0-2.5-1.8-4-4-4s-4 1.5-4 4M12 12a3.5 3.5 0 100-7 3.5 3.5 0 000 7z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           <span id="user-count-value">1</span>
         </span>
-        <button id="btn-sync" class="btn-ghost" title="Forzar re-sincronización con la sala">Sincronizar</button>
-        <button id="btn-copy-link" class="btn-ghost">Copiar link de invitación</button>
-        <button id="btn-leave" class="btn-ghost btn-danger">Salir</button>
+
+        <button id="btn-sync" class="pill-btn" title="Pedir el estado exacto al servidor">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M20 11a8 8 0 10-2.3 5.7M20 5v6h-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>Sincronizar</span>
+        </button>
+
+        <button id="btn-theater" class="pill-btn" title="Modo cine: oculta interfaz (T)" aria-label="Modo cine">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M3 9h18M3 15h18" stroke="currentColor" stroke-width="1.6"/></svg>
+        </button>
+
+        <button id="btn-fullscreen" class="pill-btn accent" title="Pantalla completa: oculta las barras del navegador (F). Esc para salir" aria-label="Pantalla completa">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>Pantalla completa</span>
+        </button>
+
+        <button id="btn-copy-link" class="pill-btn primary" title="Copiar link de invitación">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M10 13a5 5 0 007.1 0l2-2a5 5 0 00-7.1-7.1l-1.1 1.1M14 11a5 5 0 00-7.1 0l-2 2a5 5 0 007.1 7.1l1.1-1.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span>Invitar</span>
+        </button>
       </div>
     </header>
 
-    <div class="room-body">
-      <div class="main-column">
-        <section class="video-wrap">
-          <video id="video-player" controls playsinline></video>
-          <div id="youtube-player" class="youtube-player hidden"></div>
-          <div class="video-placeholder" id="video-placeholder">
-            <p>Todavía no cargaron ningún video.</p>
-            <p class="sub">Pegá un link de YouTube, o uno directo .mp4 / .m3u8, para empezar.</p>
+    <div class="stage">
+      <div class="stage-main">
+        <section class="player-shell" id="player-shell" aria-label="Reproductor compartido">
+          <video id="video-player" controls playsinline preload="auto"></video>
+          <div id="youtube-player" class="youtube-player hidden"><div id="yt-target"></div></div>
+
+          <div class="player-overlay empty" id="video-placeholder">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" width="34" height="34" fill="none" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3" stroke="currentColor" stroke-width="1.4"/><path d="M10 9.5l5 2.5-5 2.5v-5z" fill="currentColor"/></svg>
+            </div>
+            <h2>Todavía no hay video</h2>
+            <p>Pegá un link de YouTube, un .mp4 o un stream .m3u8 abajo y se cargará para todos.</p>
           </div>
-          <button id="play-unlock" class="play-unlock hidden">▶ Tocá para sincronizar la reproducción</button>
+
+          <div class="player-overlay loading hidden" id="video-loading" role="status">
+            <span class="spinner"></span>
+            <span id="loading-text">Cargando video…</span>
+          </div>
+
+          <div class="player-overlay failure hidden" id="video-error" role="alert">
+            <span class="failure-icon">!</span>
+            <h3>No se pudo cargar el video</h3>
+            <p id="error-text">Puede estar bloqueado, ser privado o el link no ser válido.</p>
+            <div class="failure-actions">
+              <button id="btn-retry" class="pill-btn primary">Reintentar</button>
+              <button id="btn-error-copy" class="pill-btn">Copiar link</button>
+            </div>
+          </div>
+
+          <button id="play-unlock" class="player-overlay unlock hidden">
+            <span class="unlock-play">▶</span>
+            <strong>Tocá para activar la reproducción</strong>
+            <span>El navegador bloqueó el audio automático. Un toque y todos quedan sincronizados.</span>
+          </button>
+
+          <div id="fs-hint" class="fs-hint hidden">Esc para salir de pantalla completa</div>
         </section>
 
-        <section class="video-url-bar">
-          <input type="text" id="input-video-url" placeholder="Pegá un link de YouTube o un video directo (.mp4 / .m3u8)">
-          <button id="btn-load-video" class="btn-primary btn-compact">Cargar para todos</button>
-        </section>
+        <div class="control-dock">
+          <div class="url-field">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" aria-hidden="true"><path d="M10 13a5 5 0 007.1 0l2-2a5 5 0 00-7.1-7.1l-1.1 1.1M14 11a5 5 0 00-7.1 0l-2 2a5 5 0 007.1 7.1l1.1-1.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+            <input type="text" id="input-video-url" placeholder="Pegá un link de YouTube, .mp4 o .m3u8…" spellcheck="false" aria-label="Link del video">
+            <button id="btn-load-video" class="btn-accent">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Cargar
+            </button>
+          </div>
+          <div class="dock-meta">
+            <span id="video-source" class="source-pill">Sin video</span>
+            <span class="dock-hint">Todos pueden cargar y controlar el video</span>
+          </div>
+        </div>
       </div>
 
-      <aside class="chat-panel">
-        <div class="chat-header">Chat de la sala</div>
-        <div class="chat-messages" id="chat-messages"></div>
+      <aside class="chat-panel" id="chat-panel">
+        <div class="chat-header">
+          <span class="chat-title">Chat</span>
+          <span class="chat-live"><span class="live-dot"></span> EN VIVO</span>
+          <button id="btn-chat-toggle" class="chat-toggle" title="Mostrar/ocultar chat" aria-label="Mostrar u ocultar chat">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <div class="chat-messages" id="chat-messages" aria-live="polite"></div>
         <form id="chat-form" class="chat-form" autocomplete="off">
-          <input type="text" id="chat-input" placeholder="Escribí algo..." maxlength="500">
-          <button type="submit" class="chat-send" aria-label="Enviar">➤</button>
+          <input type="text" id="chat-input" placeholder="Escribí algo…" maxlength="400" aria-label="Mensaje">
+          <button type="submit" class="send-btn" aria-label="Enviar mensaje">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none"><path d="M4 12l16-8-6 16-2.5-6.5L4 12z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+          </button>
         </form>
       </aside>
     </div>
 
-    <p id="copy-toast" class="toast hidden">¡Link copiado!</p>
+    <div id="copy-toast" class="toast hidden">Link copiado ✓</div>
   </main>
+
+  <noscript>Esta app necesita JavaScript para funcionar.</noscript>
 
   <script src="/socket.io/socket.io.js"></script>
   <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
   <script src="/client.js"></script>
 </body>
 </html>
