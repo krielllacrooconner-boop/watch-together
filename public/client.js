@@ -14,6 +14,7 @@
   // ============================================================
 
   const $ = (id) => document.getElementById(id);
+  const BUILD = 'v5';
   const STORE_KEY = 'syncroom:join:v2';
   const CLIENT_KEY = 'syncroom:client:v1';
 
@@ -38,8 +39,11 @@
     urlInput: $('input-video-url'), loadBtn: $('btn-load-video'),
 
     chatPanel: $('chat-panel'), chatMessages: $('chat-messages'),
-    chatForm: $('chat-form'), chatInput: $('chat-input'), chatToggle: $('btn-chat-toggle')
+    chatForm: $('chat-form'), chatInput: $('chat-input'), chatToggle: $('btn-chat-toggle'),
+    buildTag: $('build-tag')
   };
+
+  if (el.buildTag) el.buildTag.textContent = BUILD;
 
   const socket = io({
     reconnection: true,
@@ -83,6 +87,7 @@
 
   let nudgeTimer = null;
   let nudgeActive = false;
+  let lastSync = null;
   let unlockWatch = null;
   let ytPauseTimer = null;
   let ytWatch = { pos: 0, at: 0, lastSeekAt: 0 };
@@ -91,6 +96,10 @@
   let uiTimer = null;
   let hintTimer = null;
   let lastPeerSignature = '';
+  let seekTimer = null;
+  let pendingSeekPos = null;
+  let ytIgnoreUntil = 0;
+  let ytRebase = true;
 
   let queuedCommands = [];
   let theater = false;
@@ -188,6 +197,27 @@
     markLocalIntent(1600);
   }
 
+  // Arrastrar la barra dispara muchos "seeked" seguidos. Mandamos uno
+  // solo, con la posición final, 160 ms después del último movimiento.
+  function queueSeek(position) {
+    pendingSeekPos = position;
+    clearTimeout(seekTimer);
+    seekTimer = setTimeout(() => {
+      const pos = pendingSeekPos;
+      pendingSeekPos = null;
+      if (pos == null) return;
+      emitCommand('seek', pos, { seek: true });
+    }, 160);
+  }
+
+  function flushSeek() {
+    if (pendingSeekPos == null) return;
+    clearTimeout(seekTimer);
+    const pos = pendingSeekPos;
+    pendingSeekPos = null;
+    emitCommand('seek', pos, { seek: true });
+  }
+
   function computeTarget(p) {
     // OJO: usamos la hora LOCAL de recepción, nunca `sentAt` del servidor.
     // Si el reloj del usuario está mal configurado, restar contra la hora
@@ -249,6 +279,12 @@
     try {
       if (isYoutube()) {
         if (!isLive()) ytPlayer.seekTo(t, true);
+        // La referencia del detector pasa a ser el destino del seek
+        // propio. Así, aunque YouTube tarde en bufferear más que la
+        // ventana de gracia, al volver no confundimos nuestro seek con
+        // un arrastre del usuario.
+        ytWatch.pos = t;
+        ytWatch.at = Date.now();
       } else {
         el.video.currentTime = Number.isFinite(el.video.duration) ? Math.min(t, el.video.duration) : t;
       }
@@ -315,6 +351,7 @@
       if (result && result.catch) {
         result.catch((err) => {
           if (!currentVideo || videoMode === 'youtube') return;
+          if (err && err.name === 'AbortError') return;
           if (err && err.name === 'NotAllowedError') showUnlock(true);
           else if (err && err.name === 'NotSupportedError') showError('Este formato no es compatible con tu navegador.');
           else showLoading(true, 'Esperando el video…');
@@ -402,6 +439,10 @@
     if (!p) return;
     p.receivedAt = Date.now();
 
+    // Si el usuario acaba de arrastrar la barra de YouTube, su posición
+    // manda: no dejamos que un evento remoto lo devuelva atrás.
+    if (checkYtSeek()) return;
+
     if (Number.isFinite(p.revision)) latestRevision = Math.max(latestRevision, p.revision);
     const target = computeTarget(p);
     latestPlayback = p;
@@ -444,9 +485,13 @@
     if (!p) return;
     p.receivedAt = Date.now();
 
+    // Mismo chequeo que en applyPlayback: si el usuario movió la barra
+    // de YouTube, reportamos ese seek antes de corregir la deriva.
+    if (checkYtSeek()) return;
+
     const revision = Number.isFinite(p.revision) ? p.revision : latestRevision;
-    if (revision < latestRevision) return; // tick viejo
-    if (Date.now() < localIntentUntil && revision === latestRevision) return;
+    if (revision < latestRevision) { lastSync = { reason: 'oldRev', rev: revision, latest: latestRevision }; return; } // tick viejo
+    if (Date.now() < localIntentUntil && revision === latestRevision) { lastSync = { reason: 'localIntent', left: localIntentUntil - Date.now() }; return; }
 
     const target = computeTarget(p);
     latestPlayback = p;
@@ -499,13 +544,18 @@
     }
 
     // Mientras bufferea no conviene mover la posición: empeora el stall.
-    if (buffering || isLive()) return;
+    if (buffering || isLive()) { lastSync = { reason: buffering ? 'buffering' : 'live', pos: +getPosition().toFixed(2) }; return; }
 
     const diff = target - getPosition();
     const distance = Math.abs(diff);
     // Pausados conviene quedar casi exactos porque de ahí arranca el
     // siguiente play; reproduciendo toleramos un poco más.
     const tolerance = p.playing ? 1.2 : 0.4;
+    lastSync = {
+      t: Date.now(), reason: 'diff', target: +target.toFixed(2), pos: +getPosition().toFixed(2),
+      distance: +distance.toFixed(2), tol: tolerance, playing: !!p.playing, rev: revision,
+      seekAgo: lastLocalSeekAt ? Date.now() - lastLocalSeekAt : null
+    };
 
     if (distance > tolerance) {
       suppressUntil = Date.now() + 750;
@@ -567,6 +617,8 @@
     clearTimeout(unlockWatch);
     clearTimeout(ytPauseTimer);
     clearTimeout(nudgeTimer);
+    clearTimeout(seekTimer);
+    pendingSeekPos = null;
     nudgeActive = false;
     pendingYt = null;
     videoMode = 'none';
@@ -595,6 +647,8 @@
   function applySource(info, p, force) {
     if (!info) { clearVideo(); return; }
     if (p) p.receivedAt = Date.now();
+    clearTimeout(seekTimer);
+    pendingSeekPos = null;
 
     if (p && Number.isFinite(p.revision)) latestRevision = Math.max(latestRevision, p.revision);
 
@@ -752,14 +806,23 @@
           ytReady = true;
           ytState = YT.PlayerState.UNSTARTED;
           suppressUntil = Date.now() + 1200;
+          // El seek inicial a la posición de la sala no debe confundirse
+          // con un arrastre del usuario.
+          markProgrammatic(2000);
           hideError();
           showLoading(false);
           setStatus(expectedPlaying ? 'Sincronizado' : 'Listo', 'ok');
           try { event.target.setPlaybackRate(ytRate(options.rate || 1)); } catch { /* ignore */ }
           try { if (event.target.setPlaybackQuality) event.target.setPlaybackQuality('hd1080'); } catch { /* ignore */ }
-          if (options.position > 0) event.target.seekTo(options.position, true);
+          if (options.position > 0) {
+            event.target.seekTo(options.position, true);
+            // Referencia inicial = destino del seek, no la posición 0.
+            ytWatch.pos = options.position;
+            ytWatch.at = Date.now();
+          } else {
+            resetYtWatch();
+          }
           if (options.playing) playLocal(); else event.target.pauseVideo();
-          resetYtWatch();
           reportPeer();
         },
         onStateChange: (event) => {
@@ -773,6 +836,10 @@
             showLoading(false);
             buffering = false;
             bufferingSince = 0;
+            // Apenas YouTube sale del buffering, revisamos si hubo un
+            // arrastre. Si esperáramos al intervalo de 250 ms, un tick
+            // viejo podría devolver el video a la posición anterior.
+            checkYtSeek();
             reportPeer();
             updateOrb(true);
             try { if (ytPlayer.setPlaybackQuality) ytPlayer.setPlaybackQuality('hd1080'); } catch { /* ignore */ }
@@ -783,7 +850,6 @@
             if (!expectedPlaying && !isProgrammatic()) {
               emitCommand('play', ytPlayer.getCurrentTime());
             }
-            resetYtWatch();
             return;
           }
 
@@ -791,11 +857,17 @@
             showLoading(false);
             buffering = false;
             bufferingSince = 0;
+            // Mismo caso que PLAYING: un arrastre estando pausado también
+            // pasa por BUFFERING y hay que reportarlo cuanto antes.
+            checkYtSeek();
             reportPeer();
             updateOrb(false);
-            resetYtWatch();
 
-            if (expectedPlaying && !isProgrammatic()) {
+            // OJO: si el video todavía no arrancó nunca, este PAUSED es el
+            // bloqueo de autoplay del navegador (o el pauseVideo inicial),
+            // no una acción del usuario. Si lo mandáramos, un viewer nuevo
+            // pausaría la sala de todos.
+            if (expectedPlaying && started && !isProgrammatic()) {
               markLocalIntent(1600);
               // Pequeño debounce: al arrastrar la barra YouTube a veces
               // manda PAUSED y enseguida PLAYING. No queremos pausar a todos.
@@ -815,7 +887,8 @@
             showLoading(true, 'Buffering…');
             reportPeer();
             if (!suppressed()) markLocalIntent(1200);
-            resetYtWatch();
+            // No reseteamos ytWatch: al volver de buffering comparamos
+            // contra la última posición buena para detectar el arrastre.
             return;
           }
 
@@ -920,7 +993,7 @@
   el.video.addEventListener('seeked', () => {
     if (isProgrammatic()) return;
     markLocalSeek();
-    emitCommand('seek', el.video.currentTime, { seek: true });
+    queueSeek(el.video.currentTime);
   });
 
   el.video.addEventListener('play', () => {
@@ -928,12 +1001,14 @@
     // propia sincronización, no una acción del usuario.
     if (expectedPlaying || isProgrammatic()) return;
     markLocalIntent(1500);
+    flushSeek();
     emitCommand('play', el.video.currentTime);
   });
 
   el.video.addEventListener('pause', () => {
-    if (!expectedPlaying || isProgrammatic()) return;
+    if (!expectedPlaying || !started || isProgrammatic()) return;
     markLocalIntent(1500);
+    flushSeek();
     emitCommand('pause', el.video.currentTime);
   });
 
@@ -958,37 +1033,59 @@
   // ------------------------------------------------------------
   // Detector de seeks de YouTube (la API no expone "seeked")
   // ------------------------------------------------------------
-  setInterval(() => {
-    if (videoMode !== 'youtube' || !ytPlayer || !window.YT || ytState === null) return;
+  // Además de detectarlos cada 250 ms, se llama al principio de cada
+  // tick: si el usuario acaba de arrastrar la barra, el tick NO debe
+  // devolverle el video a la posición vieja antes de que lo detectemos.
+  function checkYtSeek() {
+    if (videoMode !== 'youtube' || !ytPlayer || !window.YT || !ytReady) return false;
+
+    const now = Date.now();
+
+    // Ventana de gracia: después de un seek (nuestro o del usuario)
+    // YouTube tarda en reflejar la posición nueva. Si muestreáramos
+    // en ese lapso, confundiríamos la posición vieja con otro arrastre.
+    if (isProgrammatic()) { ytRebase = true; return false; }
+    if (now < ytIgnoreUntil) return false;
+
+    // Durante BUFFERING (lo que dispara YouTube al arrastrar) no
+    // tocamos la referencia: al volver comparamos contra la última
+    // posición buena. Si la reiniciáramos, el salto se perdería.
+    if (buffering) return false;
+
     if (ytState !== YT.PlayerState.PLAYING && ytState !== YT.PlayerState.PAUSED) {
-      resetYtWatch();
-      return;
-    }
-    if (suppressed() || isProgrammatic() || Date.now() < localIntentUntil || buffering) {
-      resetYtWatch();
-      return;
+      ytRebase = true;
+      return false;
     }
 
     const pos = ytPlayer.getCurrentTime();
-    const now = Date.now();
-    if (!ytWatch.at) { resetYtWatch(); return; }
+
+    if (ytRebase || !ytWatch.at) {
+      ytRebase = false;
+      ytWatch.pos = pos;
+      ytWatch.at = now;
+      return false;
+    }
 
     const elapsed = (now - ytWatch.at) / 1000;
-    const expectedMove = ytState === YT.PlayerState.PLAYING ? elapsed * getRate() : 0;
-    const jump = (pos - ytWatch.pos) - expectedMove;
+    // Tope de 3 s: si hubo un stall largo, no confundimos eso con un seek.
+    const maxAdvance = Math.min(elapsed * Math.max(0.5, getRate()), 3);
+    const delta = pos - ytWatch.pos;
 
-    if (Math.abs(jump) > 1.1 && now - ytWatch.lastSeekAt > 900) {
+    if (delta > maxAdvance + 1.0 || delta < -1.0) {
       ytWatch.lastSeekAt = now;
-      lastLocalSeekAt = now;
-      markLocalIntent(1600);
+      markLocalSeek();
       emitCommand('seek', pos, { seek: true });
-      resetYtWatch();
-      return;
+      ytIgnoreUntil = now + 2500;
+      ytRebase = true;
+      return true;
     }
 
     ytWatch.pos = pos;
     ytWatch.at = now;
-  }, 500);
+    return false;
+  }
+
+  setInterval(checkYtSeek, 250);
 
   // ------------------------------------------------------------
   // Usuarios / chat
@@ -1347,6 +1444,7 @@
   // Diagnóstico liviano (consola del navegador):
   //   __syncroomDebug()
   window.__syncroomDebug = () => ({
+    build: BUILD,
     room: currentRoomId,
     name: myName,
     clientId,
@@ -1358,6 +1456,11 @@
     playingNow: isPlayingLocally(),
     buffering,
     position: Number(getPosition().toFixed(2)),
+    target: latestPlayback ? Number(computeTarget(latestPlayback).toFixed(2)) : null,
+    nudge: nudgeActive,
+    lastSync: lastSync ? { ...lastSync, t: undefined } : null,
+    suppressMs: Math.max(0, suppressUntil - Date.now()),
+    localIntentMs: Math.max(0, localIntentUntil - Date.now()),
     rate: getRate(),
     revision: latestRevision,
     pending: pending ? { ...pending } : null

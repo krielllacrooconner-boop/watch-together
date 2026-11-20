@@ -70,9 +70,16 @@ function sanitizeUrl(raw) {
 
   // Si pegaron texto con el link en medio, tomamos la primera URL http(s)
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
-  if (!match) return null;
+  if (match) {
+    text = match[0];
+  } else {
+    // Aceptamos links pegados sin protocolo: "youtu.be/ID", "vimeo.com/123".
+    const first = text.split(/\s+/)[0].replace(/[)\],.;!]+$/g, '');
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+(\/|$)/i.test(first)) return null;
+    text = 'https://' + first;
+  }
   // Sacamos puntuación que suele quedar pegada al copiar ("...)", "...,")
-  text = match[0].replace(/[)\],.;!]+$/g, '');
+  text = text.replace(/[)\],.;!]+$/g, '');
 
   try {
     const url = new URL(text);
