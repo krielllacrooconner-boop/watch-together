@@ -661,6 +661,7 @@ button:focus-visible, input:focus-visible {
   box-shadow: 0 8px 22px -10px rgba(45, 212, 191, 0.8);
 }
 .dock-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; padding: 0 3px; }
+.dock-meta-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .source-pill {
   font-family: var(--font-mono);
   font-size: 10.5px;
@@ -670,6 +671,29 @@ button:focus-visible, input:focus-visible {
   padding: 3px 9px;
   background: rgba(45, 212, 191, 0.06);
 }
+.speed-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+}
+.speed-control select {
+  appearance: none;
+  padding: 3px 20px 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%) calc(100% - 10px) 52% / 4px 4px no-repeat,
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%) calc(100% - 6px) 52% / 4px 4px no-repeat,
+    var(--surface);
+  color: var(--text);
+  font-size: 10.5px;
+  cursor: pointer;
+  outline: none;
+}
+.speed-control select:hover { border-color: var(--border-strong); }
 .dock-hint { font-size: 11px; color: var(--faint); }
 
 /* Chat */

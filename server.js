@@ -59,6 +59,11 @@ function sanitizeName(raw) {
   return name || 'Invitado';
 }
 
+function sanitizeClientId(raw) {
+  const id = String(raw || '').trim();
+  return /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : null;
+}
+
 function sanitizeUrl(raw) {
   let text = String(raw || '').trim();
   if (!text || text.length > MAX_URL_LENGTH) return null;
@@ -66,7 +71,8 @@ function sanitizeUrl(raw) {
   // Si pegaron texto con el link en medio, tomamos la primera URL http(s)
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
   if (!match) return null;
-  text = match[0];
+  // Sacamos puntuación que suele quedar pegada al copiar ("...)", "...,")
+  text = match[0].replace(/[)\],.;!]+$/g, '');
 
   try {
     const url = new URL(text);
@@ -96,9 +102,26 @@ function youtubeId(raw) {
   return null;
 }
 
+function youtubeStart(url) {
+  try {
+    const parsed = new URL(url);
+    const raw = parsed.searchParams.get('t') || parsed.searchParams.get('start');
+    if (!raw) return 0;
+    if (/^\d+$/.test(raw)) return clampNumber(raw, 0, MAX_POSITION, 0);
+    const match = raw.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+    if (!match) return 0;
+    return clampNumber(
+      Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0),
+      0, MAX_POSITION, 0
+    );
+  } catch {
+    return 0;
+  }
+}
+
 function detectVideoType(url) {
   const id = youtubeId(url);
-  if (id) return { type: 'youtube', url, id };
+  if (id) return { type: 'youtube', url, id, start: youtubeStart(url) };
 
   const clean = url.split(/[?#]/)[0].toLowerCase();
   if (/\.m3u8$/.test(clean) || /\/manifest\.m3u8/.test(clean)) {
@@ -228,14 +251,9 @@ function leaveRoom(socket) {
   ensureHost(room);
 
   if (room.users.size === 0) {
-    // Congelamos el reloj: si todos salen, el video no debe seguir avanzando
-    // en una sala vacía (y al volver, tampoco dar un salto de minutos).
-    if (room.playback.playing) {
-      room.playback.position = playbackOf(room).position;
-      room.playback.playing = false;
-      room.playback.updatedAt = Date.now();
-      room.revision += 1;
-    }
+    // No congelamos el reloj al instante: un simple F5 desconecta y
+    // reconecta en menos de un segundo. Marcamos la sala como vacía y
+    // el tick global la pausa recién si sigue vacía unos segundos.
     room.emptySince = Date.now();
   } else {
     pushMessage(room, roomId, {
@@ -276,6 +294,7 @@ io.on('connection', (socket) => {
 
     const password = payload.password == null ? '' : String(payload.password).slice(0, 100);
     const name = sanitizeName(payload && payload.name);
+    const clientId = sanitizeClientId(payload && payload.clientId);
 
     const existing = rooms[requestedId];
     if (existing && existing.password && existing.password !== password) {
@@ -288,16 +307,39 @@ io.on('connection', (socket) => {
     const room = existing || (rooms[requestedId] = createRoom(requestedId, password));
     room.emptySince = null;
 
+    // Si es una reconexión (misma pestaña, mismo clientId), reemplazamos
+    // la sesión vieja para no duplicar avatares ni usuarios fantasma.
+    let replaced = null;
+    if (clientId) {
+      for (const [sid, user] of room.users) {
+        if (user.clientId === clientId) { replaced = [sid, user]; break; }
+      }
+    }
+    const wasHost = replaced ? room.hostId === replaced[0] : false;
+    const previousColor = replaced ? replaced[1].color : null;
+
+    if (replaced) {
+      room.users.delete(replaced[0]);
+      const oldSocket = io.sockets.sockets.get(replaced[0]);
+      if (oldSocket) {
+        oldSocket.data.roomId = null;
+        oldSocket.leave(requestedId);
+      }
+    }
+
     socket.join(requestedId);
     socket.data.roomId = requestedId;
     socket.data.name = name;
+    room.emptySince = null;
     room.users.set(socket.id, {
       name,
-      color: pickColor(room),
+      color: previousColor || pickColor(room),
+      clientId,
       buffering: false,
       synced: true
     });
     ensureHost(room);
+    if (wasHost) room.hostId = socket.id;
 
     socket.emit('room:joined', {
       ...publicRoom(room),
@@ -307,7 +349,7 @@ io.on('connection', (socket) => {
     pushMessage(room, requestedId, {
       name: 'Sistema',
       system: true,
-      text: `${name} se unió a la sala.`
+      text: replaced ? `${name} se reconectó a la sala.` : `${name} se unió a la sala.`
     });
   });
 
@@ -330,19 +372,25 @@ io.on('connection', (socket) => {
   socket.on('playback:command', (payload = {}) => {
     const roomId = socket.data.roomId;
     const room = rooms[roomId];
-    if (!room || !room.video || !rateLimit(socket, 'command', 40, 2000)) return;
+    if (!room || !room.video || !rateLimit(socket, 'command', 90, 2000)) return;
 
     const action = String(payload.action || '');
     const nowPosition = playbackOf(room).position;
     const p = room.playback;
 
+    // Si el cliente acaba de hacer un seek local, su "time" es más confiable
+    // que el reloj del servidor (que todavía puede estar en la posición vieja).
+    const trustedTime = payload.seek === true
+      ? clampNumber(payload.time, 0, MAX_POSITION, nowPosition)
+      : nowPosition;
+
     switch (action) {
       case 'play':
-        p.position = nowPosition;
+        p.position = trustedTime;
         p.playing = true;
         break;
       case 'pause':
-        p.position = nowPosition;
+        p.position = trustedTime;
         p.playing = false;
         break;
       case 'seek':
@@ -375,8 +423,14 @@ io.on('connection', (socket) => {
       return;
     }
 
-    room.video = detectVideoType(url);
-    room.playback = { position: 0, playing: false, rate: 1, updatedAt: Date.now() };
+    const video = detectVideoType(url);
+    room.video = video;
+    room.playback = {
+      position: video.start || 0,
+      playing: false,
+      rate: 1,
+      updatedAt: Date.now()
+    };
     room.revision += 1;
 
     io.to(roomId).emit('video:changed', {
@@ -414,9 +468,20 @@ io.on('connection', (socket) => {
 });
 
 // Tick global: una sola fuente de verdad para todas las salas.
+const EMPTY_PAUSE_GRACE = 5000;
 setInterval(() => {
+  const now = Date.now();
   for (const room of Object.values(rooms)) {
-    if (room.users.size === 0) continue;
+    if (room.users.size === 0) {
+      // Pausa diferida: si nadie volvió en 5 s, el reloj se detiene.
+      if (room.playback.playing && room.emptySince && now - room.emptySince > EMPTY_PAUSE_GRACE) {
+        room.playback.position = playbackOf(room).position;
+        room.playback.playing = false;
+        room.playback.updatedAt = now;
+        room.revision += 1;
+      }
+      continue;
+    }
     io.to(room.id).emit('sync:tick', playbackOf(room));
   }
 }, TICK_MS);

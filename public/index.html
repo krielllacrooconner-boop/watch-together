@@ -166,6 +166,7 @@
             <div class="failure-actions">
               <button id="btn-retry" class="pill-btn primary">Reintentar</button>
               <button id="btn-error-copy" class="pill-btn">Copiar link</button>
+              <button id="btn-error-open" class="pill-btn">Abrir link</button>
             </div>
           </div>
 
@@ -188,7 +189,19 @@
             </button>
           </div>
           <div class="dock-meta">
-            <span id="video-source" class="source-pill">Sin video</span>
+            <div class="dock-meta-left">
+              <span id="video-source" class="source-pill">Sin video</span>
+              <label class="speed-control" title="Velocidad de reproducción (se sincroniza para todos)">
+                <span>Velocidad</span>
+                <select id="speed-select" aria-label="Velocidad de reproducción">
+                  <option value="0.75">0.75×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.25">1.25×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
+                </select>
+              </label>
+            </div>
             <span class="dock-hint">Todos pueden cargar y controlar el video</span>
           </div>
         </div>

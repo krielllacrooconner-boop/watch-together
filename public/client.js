@@ -3,13 +3,19 @@
 
   // ============================================================
   // SyncRoom — cliente
-  // El servidor manda un "tick" por segundo con la posición exacta.
-  // Acá solo corregimos la deriva local: nunca mandamos nuestra
-  // posición de forma periódica (eso era lo que rompía la sync).
+  //
+  // Reglas de oro de la sincronización:
+  //  1. El servidor es el reloj autoritativo (sync:tick cada segundo).
+  //  2. Una acción local (play/pause/seek/velocidad) "manda" durante
+  //     1,5 s. En ese lapso ignoramos ticks viejos para que no te
+  //     devuelvan el video atrás mientras arrastrás la barra.
+  //  3. YouTube no tiene evento "seek": lo detectamos comparando la
+  //     posición real con la esperada.
   // ============================================================
 
   const $ = (id) => document.getElementById(id);
   const STORE_KEY = 'syncroom:join:v2';
+  const CLIENT_KEY = 'syncroom:client:v1';
 
   const el = {
     landing: $('view-landing'), room: $('view-room'),
@@ -22,11 +28,13 @@
     btnSync: $('btn-sync'), btnFullscreen: $('btn-fullscreen'), btnTheater: $('btn-theater'),
     btnCopy: $('btn-copy-link'), btnLeave: $('btn-leave'), toast: $('copy-toast'),
 
-    video: $('video-player'), ytBox: $('youtube-player'), ytTarget: $('yt-target'), placeholder: $('video-placeholder'),
+    video: $('video-player'), ytBox: $('youtube-player'), ytTarget: $('yt-target'),
+    placeholder: $('video-placeholder'),
     loading: $('video-loading'), loadingText: $('loading-text'),
     failure: $('video-error'), errorText: $('error-text'),
-    retry: $('btn-retry'), errorCopy: $('btn-error-copy'),
+    retry: $('btn-retry'), errorCopy: $('btn-error-copy'), errorOpen: $('btn-error-open'),
     unlock: $('play-unlock'), fsHint: $('fs-hint'), source: $('video-source'),
+    speed: $('speed-select'),
     urlInput: $('input-video-url'), loadBtn: $('btn-load-video'),
 
     chatPanel: $('chat-panel'), chatMessages: $('chat-messages'),
@@ -41,37 +49,50 @@
     timeout: 10000
   });
 
-  // --- Estado ---
+  // ------------------------------------------------------------
+  // Estado local
+  // ------------------------------------------------------------
   let joinInfo = null;
   let currentRoomId = null;
   let myName = 'Invitado';
   let myId = null;
   let isHost = false;
+  let clientId = getClientId();
 
   let videoMode = 'none'; // none | file | hls | direct | youtube
-  let currentVideo = null; // { type, url, id? }
+  let currentVideo = null;
   let mediaReady = false;
   let ytPlayer = null;
   let ytState = null;
+  let ytReady = false;
   let ytApiReady = false;
   let pendingYt = null;
   let hls = null;
 
-  let pending = null; // { target, playing, rate } mientras el media no está listo
-  let latestPlayback = { position: 0, playing: false, rate: 1, sentAt: Date.now() };
+  let pending = null;
+  let latestPlayback = { position: 0, playing: false, rate: 1, receivedAt: Date.now(), revision: -1 };
+  let latestRevision = -1;
   let expectedPlaying = false;
   let suppressUntil = 0;
+  let programmaticUntil = 0;
+  let localIntentUntil = 0;
+  let lastLocalSeekAt = 0;
   let buffering = false;
+  let bufferingSince = 0;
   let started = false;
 
   let nudgeTimer = null;
   let nudgeActive = false;
   let unlockWatch = null;
+  let ytPauseTimer = null;
+  let ytWatch = { pos: 0, at: 0, lastSeekAt: 0 };
   let statusTimer = null;
   let toastTimer = null;
   let uiTimer = null;
   let hintTimer = null;
+  let lastPeerSignature = '';
 
+  let queuedCommands = [];
   let theater = false;
   let fullscreenActive = false;
 
@@ -83,18 +104,36 @@
   function show(node) { node.classList.remove('hidden'); }
   function hide(node) { node.classList.add('hidden'); }
 
+  function getClientId() {
+    try {
+      let id = sessionStorage.getItem(CLIENT_KEY);
+      if (!id) {
+        id = (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID().replace(/-/g, '')
+          : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+        sessionStorage.setItem(CLIENT_KEY, id);
+      }
+      return id;
+    } catch {
+      return 'c' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+  }
+
   function showLoading(on, text) {
     if (text) el.loadingText.textContent = text;
     el.loading.classList.toggle('hidden', !on);
     if (on) hide(el.failure);
   }
+
   function showError(text) {
     hide(el.loading);
     hide(el.unlock);
     el.errorText.textContent = text || 'No se pudo cargar el video. Probá con otro link.';
     show(el.failure);
     setStatus('Error de video', 'bad');
+    clearTimeout(unlockWatch);
   }
+
   function hideError() { hide(el.failure); }
 
   function showUnlock(on) {
@@ -106,6 +145,11 @@
     } else {
       hide(el.unlock);
     }
+  }
+
+  function hideUnlock() {
+    hide(el.unlock);
+    clearTimeout(unlockWatch);
   }
 
   function toast(text) {
@@ -125,6 +169,7 @@
     void el.orb.offsetWidth;
     el.orb.classList.add('pulse');
   }
+
   function updateOrb(playing) {
     el.orb.classList.remove('playing', 'paused');
     el.orb.classList.add(playing ? 'playing' : 'paused');
@@ -134,22 +179,38 @@
     return String(name || '?').trim().slice(0, 2).toUpperCase();
   }
 
-  // ------------------------------------------------------------
-  // Reloj / posición
-  // ------------------------------------------------------------
+  function markLocalIntent(ms = 1500) {
+    localIntentUntil = Math.max(localIntentUntil, Date.now() + ms);
+  }
+
+  function markLocalSeek() {
+    lastLocalSeekAt = Date.now();
+    markLocalIntent(1600);
+  }
+
   function computeTarget(p) {
-    const age = Math.max(0, Date.now() - (p && p.sentAt ? p.sentAt : Date.now()));
+    // OJO: usamos la hora LOCAL de recepción, nunca `sentAt` del servidor.
+    // Si el reloj del usuario está mal configurado, restar contra la hora
+    // del servidor producía saltos gigantes (y videos que "no avanzaban").
+    const stamp = p && (p.receivedAt || p.sentAt) ? (p.receivedAt || p.sentAt) : Date.now();
+    const age = Math.max(0, Date.now() - stamp);
     return Math.max(0, (p && p.position ? p.position : 0) + (p && p.playing ? (age / 1000) * (p.rate || 1) : 0));
   }
 
   function suppressed() { return Date.now() < suppressUntil; }
 
-  function isYoutube() { return videoMode === 'youtube' && ytPlayer && typeof ytPlayer.getCurrentTime === 'function'; }
+  function markProgrammatic(ms = 450) {
+    programmaticUntil = Math.max(programmaticUntil, Date.now() + ms);
+  }
+
+  function isProgrammatic() { return Date.now() < programmaticUntil; }
+
+  function isYoutube() {
+    return videoMode === 'youtube' && ytPlayer && typeof ytPlayer.getCurrentTime === 'function';
+  }
 
   function isReady() {
-    if (videoMode === 'youtube') {
-      return !!(ytPlayer && typeof ytPlayer.getCurrentTime === 'function' && ytState !== null && ytState !== -1);
-    }
+    if (videoMode === 'youtube') return ytReady && isYoutube();
     return videoMode !== 'none' && mediaReady;
   }
 
@@ -159,11 +220,17 @@
   }
 
   function mediaCanPlay() {
-    if (isYoutube()) {
-      if (!window.YT) return false;
-      return ytState !== null && ytState !== YT.PlayerState.BUFFERING && ytState !== YT.PlayerState.UNSTARTED;
-    }
+    if (isYoutube()) return ytReady && isYoutube();
     return el.video.readyState >= 2;
+  }
+
+  function isLive() {
+    if (isYoutube()) {
+      try {
+        return !!(ytPlayer.getDuration && ytPlayer.getDuration() === 0 && ytState === (window.YT && YT.PlayerState.PLAYING));
+      } catch { return false; }
+    }
+    return mediaReady && (!Number.isFinite(el.video.duration) || el.video.duration === Infinity);
   }
 
   function getPosition() {
@@ -176,10 +243,16 @@
 
   function setPosition(seconds) {
     const t = Math.max(0, Number(seconds) || 0);
+    // Los seeks de YouTube tardan en reflejarse en los eventos de estado:
+    // damos más margen para no confundirlos con una acción del usuario.
+    markProgrammatic(isYoutube() ? 1600 : 600);
     try {
-      if (isYoutube()) ytPlayer.seekTo(t, true);
-      else el.video.currentTime = Number.isFinite(el.video.duration) ? Math.min(t, el.video.duration) : t;
-    } catch { /* media todavía no acepta seeks */ }
+      if (isYoutube()) {
+        if (!isLive()) ytPlayer.seekTo(t, true);
+      } else {
+        el.video.currentTime = Number.isFinite(el.video.duration) ? Math.min(t, el.video.duration) : t;
+      }
+    } catch { /* el media todavía no acepta seeks */ }
   }
 
   function ytRate(rate) {
@@ -202,21 +275,38 @@
     return el.video.playbackRate || 1;
   }
 
+  function speedValue(rate) {
+    const options = [0.75, 1, 1.25, 1.5, 2];
+    return options.reduce((best, r) => Math.abs(r - rate) < Math.abs(best - rate) ? r : best, 1);
+  }
+
+  function syncSpeedSelect(rate) {
+    if (document.activeElement === el.speed) return;
+    const value = String(speedValue(Number(rate) || 1));
+    if (el.speed.value !== value) el.speed.value = value;
+  }
+
   function nudge(diff, baseRate) {
+    if (isYoutube()) return;
     nudgeActive = true;
-    const rate = clamp(1 + diff * 0.12, 0.85, 1.15);
+    const base = clamp(Number(baseRate) || 1, 0.5, 2);
+    // El ajuste es RELATIVO a la velocidad elegida: a 1.5× no podemos
+    // bajar a 1.03× porque el video se atrasaría muchísimo. Corregimos
+    // de a poco en 1,4 s para que no se note.
+    const factor = clamp(1 + (diff / 1.4) * 0.55, 0.82, 1.18);
+    const rate = clamp(base * factor, 0.5, 2);
     suppressUntil = Date.now() + 200;
     setRate(rate);
     clearTimeout(nudgeTimer);
     nudgeTimer = setTimeout(() => {
       suppressUntil = Date.now() + 200;
-      setRate(baseRate || 1);
+      setRate(base);
       nudgeActive = false;
     }, 1400);
   }
 
   // ------------------------------------------------------------
-  // Reproducción local (sin mandar eventos propios al servidor)
+  // Reproducción local
   // ------------------------------------------------------------
   function safePlay() {
     if (isPlayingLocally()) return;
@@ -233,13 +323,23 @@
     } catch { showUnlock(true); }
   }
 
+  function scheduleYtUnlockCheck(delay = 2500) {
+    clearTimeout(unlockWatch);
+    unlockWatch = setTimeout(() => {
+      if (!expectedPlaying || !window.YT) return;
+      if (ytState === YT.PlayerState.PLAYING) return;
+      if (ytState === YT.PlayerState.BUFFERING) {
+        scheduleYtUnlockCheck(2500);
+        return;
+      }
+      showUnlock(true);
+    }, delay);
+  }
+
   function safeYtPlay() {
     if (!ytPlayer || !ytPlayer.playVideo) return;
     try { ytPlayer.unMute(); ytPlayer.playVideo(); } catch { /* ignore */ }
-    clearTimeout(unlockWatch);
-    unlockWatch = setTimeout(() => {
-      if (expectedPlaying && window.YT && ytState !== YT.PlayerState.PLAYING) showUnlock(true);
-    }, 2500);
+    scheduleYtUnlockCheck();
   }
 
   function playLocal() {
@@ -252,15 +352,43 @@
     try { if (isYoutube()) ytPlayer.pauseVideo(); else el.video.pause(); } catch { /* ignore */ }
   }
 
-  function emitCommand(action, time) {
+  function emitCommand(action, time, opts = {}) {
     if (!currentRoomId) return;
-    const payload = { action, time: Number.isFinite(time) ? time : getPosition() };
-    if (action === 'rate') payload.rate = getRate();
+    const payload = {
+      action,
+      time: Number.isFinite(time) ? time : getPosition()
+    };
+    if (action === 'rate') payload.rate = Number(opts.rate) || getRate();
+    if (opts.seek || (action === 'play' && Date.now() - lastLocalSeekAt < 2500)) payload.seek = true;
+
+    // Si la posición del cliente está lejos de la que cree el servidor
+    // (por ejemplo, arrastraste la barra y YouTube no avisó), mandamos
+    // nuestra posición como confiable. Así "play" no rebobina el video.
+    if (!payload.seek && (action === 'play' || action === 'pause')) {
+      const expected = computeTarget(latestPlayback);
+      if (Math.abs(payload.time - expected) > 1.2) payload.seek = true;
+    }
+
+    if (!socket.connected) {
+      queuedCommands.push(payload);
+      if (queuedCommands.length > 12) queuedCommands.shift();
+      return;
+    }
     socket.emit('playback:command', payload);
+  }
+
+  function flushQueuedCommands() {
+    if (!queuedCommands.length) return;
+    const commands = queuedCommands.slice();
+    queuedCommands = [];
+    commands.forEach((payload) => socket.emit('playback:command', payload));
   }
 
   function reportPeer() {
     if (!currentRoomId) return;
+    const signature = (buffering ? '1' : '0') + ':' + ((started || !expectedPlaying) ? '1' : '0');
+    if (signature === lastPeerSignature) return;
+    lastPeerSignature = signature;
     socket.emit('peer:state', {
       buffering: !!buffering,
       synced: !!(started || !expectedPlaying)
@@ -272,26 +400,38 @@
   // ------------------------------------------------------------
   function applyPlayback(p, action) {
     if (!p) return;
+    p.receivedAt = Date.now();
+
+    if (Number.isFinite(p.revision)) latestRevision = Math.max(latestRevision, p.revision);
     const target = computeTarget(p);
     latestPlayback = p;
     expectedPlaying = !!p.playing;
     updateOrb(p.playing);
+    syncSpeedSelect(p.rate);
 
     if (!isReady()) {
       pending = { target, playing: p.playing, rate: p.rate || 1 };
       return;
     }
+    pending = null;
+
+    // Una acción local reciente manda: no la pisamos con este evento.
+    if (Date.now() < localIntentUntil) return;
 
     suppressUntil = Date.now() + 900;
+    markProgrammatic(700);
     clearTimeout(nudgeTimer);
     nudgeActive = false;
 
-    if (Math.abs(getPosition() - target) > 0.6) setPosition(target);
+    if (!isLive() && Math.abs(getPosition() - target) > 0.7) setPosition(target);
     setRate(p.rate || 1);
 
     if (p.playing) {
-      if (!mediaCanPlay()) showUnlock(true);
-      else playLocal();
+      if (buffering || !mediaCanPlay()) {
+        if (el.unlock.classList.contains('hidden')) showLoading(true, 'Cargando video…');
+      } else {
+        playLocal();
+      }
     } else {
       pauseLocal();
       showLoading(false);
@@ -302,34 +442,72 @@
 
   function onTick(p) {
     if (!p) return;
+    p.receivedAt = Date.now();
+
+    const revision = Number.isFinite(p.revision) ? p.revision : latestRevision;
+    if (revision < latestRevision) return; // tick viejo
+    if (Date.now() < localIntentUntil && revision === latestRevision) return;
+
     const target = computeTarget(p);
     latestPlayback = p;
     expectedPlaying = !!p.playing;
     updateOrb(p.playing);
+    syncSpeedSelect(p.rate);
 
     if (!isReady()) {
       pending = { target, playing: p.playing, rate: p.rate || 1 };
       return;
     }
+    pending = null;
 
-    // Autoplay bloqueado: no seguimos corrigiendo hasta que la persona toque.
     if (p.playing && !isPlayingLocally()) {
       if (!el.unlock.classList.contains('hidden')) return;
-      if (mediaCanPlay()) playLocal();
-      else showUnlock(true);
+
+      // Si el video lleva mucho buffereando, insistimos con play() y,
+      // si de verdad no arranca, mostramos error con opción de reintentar.
+      const stuckFor = buffering && bufferingSince ? Date.now() - bufferingSince : 0;
+      if (stuckFor > 25000) {
+        buffering = false;
+        bufferingSince = 0;
+        showError('El video no arranca. Revisá tu conexión y tocá Reintentar.');
+        return;
+      }
+      if (stuckFor > 6000) {
+        buffering = false;
+        bufferingSince = 0;
+        suppressUntil = Date.now() + 900;
+        markProgrammatic(700);
+        playLocal();
+        return;
+      }
+
+      if (buffering || !mediaCanPlay()) {
+        showLoading(true, 'Cargando video…');
+        return;
+      }
+      suppressUntil = Date.now() + 900;
+      markProgrammatic(700);
+      playLocal();
       return;
     }
+
     if (!p.playing && isPlayingLocally()) {
       suppressUntil = Date.now() + 700;
+      markProgrammatic(700);
       pauseLocal();
       return;
     }
 
+    // Mientras bufferea no conviene mover la posición: empeora el stall.
+    if (buffering || isLive()) return;
+
     const diff = target - getPosition();
     const distance = Math.abs(diff);
+    // Pausados conviene quedar casi exactos porque de ahí arranca el
+    // siguiente play; reproduciendo toleramos un poco más.
+    const tolerance = p.playing ? 1.2 : 0.4;
 
-    if (distance > 1.2) {
-      // Salto grande: seek directo al reloj del servidor.
+    if (distance > tolerance) {
       suppressUntil = Date.now() + 750;
       setPosition(target);
       pulseOrb();
@@ -338,9 +516,18 @@
         clearTimeout(statusTimer);
         statusTimer = setTimeout(() => setStatus('Sincronizado', 'ok'), 1000);
       }
-    } else if (p.playing && distance > 0.35 && !buffering && !nudgeActive) {
-      // Desfasaje chico: aceleramos/frenamos un poco sin salto visible.
-      nudge(diff, p.rate || 1);
+    } else if (p.playing && distance > 0.6) {
+      if (isYoutube()) {
+        // YouTube solo admite velocidades discretas: un seek corto alcanza,
+        // pero no lo repetimos cada segundo (se ve como tirones).
+        if (Date.now() - lastLocalSeekAt > 4000) {
+          suppressUntil = Date.now() + 600;
+          setPosition(target);
+          lastLocalSeekAt = Date.now();
+        }
+      } else if (!nudgeActive) {
+        nudge(diff, p.rate || 1);
+      }
     }
 
     if (!nudgeActive && Math.abs(getRate() - (p.rate || 1)) > 0.01) {
@@ -365,27 +552,51 @@
     if (hls) { try { hls.destroy(); } catch { /* ignore */ } hls = null; }
   }
 
+  function resetYtWatch() {
+    ytWatch.pos = isYoutube() ? getPosition() : 0;
+    ytWatch.at = Date.now();
+  }
+
+  function resetYtBox() {
+    el.ytBox.innerHTML = '<div id="yt-target"></div>';
+    el.ytTarget = $('yt-target');
+  }
+
   function clearVideo() {
     destroyHls();
     clearTimeout(unlockWatch);
+    clearTimeout(ytPauseTimer);
+    clearTimeout(nudgeTimer);
+    nudgeActive = false;
+    pendingYt = null;
     videoMode = 'none';
     currentVideo = null;
     mediaReady = false;
     started = false;
+    buffering = false;
+    bufferingSince = 0;
+    pending = null;
+    expectedPlaying = false;
+    ytReady = false;
+    latestPlayback = { position: 0, playing: false, rate: 1, receivedAt: Date.now(), revision: latestRevision };
     try { el.video.pause(); el.video.removeAttribute('src'); el.video.load(); } catch { /* ignore */ }
     el.video.classList.add('hidden');
     el.ytBox.classList.add('hidden');
-    el.ytBox.innerHTML = '<div id="yt-target"></div>';
-    el.ytTarget = $('yt-target');
+    resetYtBox();
     show(el.placeholder);
     hide(el.loading);
     hide(el.failure);
     hide(el.unlock);
     el.source.textContent = 'Sin video';
+    syncSpeedSelect(1);
+    reportPeer();
   }
 
   function applySource(info, p, force) {
     if (!info) { clearVideo(); return; }
+    if (p) p.receivedAt = Date.now();
+
+    if (p && Number.isFinite(p.revision)) latestRevision = Math.max(latestRevision, p.revision);
 
     const same = !force && currentVideo && currentVideo.url === info.url && currentVideo.type === info.type &&
       ((videoMode === 'youtube' && ytPlayer) || (videoMode !== 'youtube' && mediaReady));
@@ -403,48 +614,63 @@
 
     started = false;
     mediaReady = false;
-    const initialTarget = computeTarget(p || latestPlayback);
-    pending = { target: initialTarget, playing: !!(p && p.playing), rate: (p && p.rate) || 1 };
+    buffering = false;
+    bufferingSince = 0;
+    const source = p || latestPlayback;
+    const initialTarget = computeTarget(source);
+    pending = { target: initialTarget, playing: !!source.playing, rate: source.rate || 1 };
     expectedPlaying = !!pending.playing;
-    latestPlayback = p || latestPlayback;
+    latestPlayback = source;
     suppressUntil = Date.now() + 1200;
     updateOrb(expectedPlaying);
-    buffering = false;
+    syncSpeedSelect(pending.rate);
     reportPeer();
 
     if (info.type === 'youtube') setupYoutube(info, pending);
-    else setupDirect(info, pending);
+    else setupDirect(info);
   }
 
-  function setupDirect(info, p) {
+  function setupDirect(info) {
     videoMode = info.type;
+    ytReady = false;
     destroyHls();
     clearTimeout(unlockWatch);
+    pendingYt = null;
+
     try { if (ytPlayer && ytPlayer.destroy) ytPlayer.destroy(); } catch { /* ignore */ }
     ytPlayer = null;
     ytState = null;
 
     el.ytBox.classList.add('hidden');
-    el.ytBox.innerHTML = '<div id="yt-target"></div>';
-    el.ytTarget = $('yt-target');
+    resetYtBox();
     el.video.classList.remove('hidden');
     el.video.controls = true;
+    el.video.preload = 'auto';
+    el.video.preservesPitch = true;
     showLoading(true, info.type === 'hls' ? 'Conectando con el stream…' : 'Preparando video…');
+
+    // Limpiamos cualquier fuente anterior antes de montar la nueva.
+    try { el.video.pause(); el.video.removeAttribute('src'); el.video.load(); } catch { /* ignore */ }
 
     if (info.type === 'hls' && window.Hls && Hls.isSupported()) {
       let recovered = 0;
       hls = new Hls({
         enableWorker: true,
         capLevelToPlayerSize: true,
-        maxBufferLength: 30,
-        backBufferLength: 60,
-        startLevel: -1
+        maxBufferLength: 40,
+        maxMaxBufferLength: 80,
+        backBufferLength: 90,
+        startLevel: -1,
+        manifestLoadingMaxRetry: 3,
+        levelLoadingMaxRetry: 3,
+        fragLoadingMaxRetry: 4
       });
-      hls.loadSource(info.url);
       hls.attachMedia(el.video);
+      hls.loadSource(info.url);
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         showLoading(false);
+        setStatus(expectedPlaying ? 'Sincronizado' : 'Listo', 'ok');
         el.source.textContent = 'HLS · adaptativo';
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -459,11 +685,17 @@
           showError('El stream no responde. Probá con otro link o reintentá.');
         }
       });
-    } else {
-      // Safari reproduce HLS nativamente; los demás, archivos directos.
-      el.video.src = info.url;
-      el.video.load();
+      return;
     }
+
+    if (info.type === 'hls' && !el.video.canPlayType('application/vnd.apple.mpegurl')) {
+      showError('Tu navegador no puede reproducir HLS y hls.js no cargó. Revisá bloqueadores de anuncios o recargá la página.');
+      return;
+    }
+
+    // Safari reproduce HLS nativamente; los demás, archivos directos.
+    el.video.src = info.url;
+    el.video.load();
   }
 
   function isYtApiReady() { return !!(window.YT && window.YT.Player); }
@@ -471,12 +703,19 @@
   function setupYoutube(info, p) {
     videoMode = 'youtube';
     mediaReady = false;
+    ytReady = false;
+    destroyHls();
     try { el.video.pause(); el.video.removeAttribute('src'); el.video.load(); } catch { /* ignore */ }
     el.video.classList.add('hidden');
     el.ytBox.classList.remove('hidden');
     showLoading(true, 'Cargando YouTube…');
 
-    const options = { videoId: info.id, position: p.target || 0, playing: p.playing, rate: p.rate || 1 };
+    const options = {
+      videoId: info.id,
+      position: p.target || 0,
+      playing: p.playing,
+      rate: p.rate || 1
+    };
 
     if (!isYtApiReady()) {
       pendingYt = options;
@@ -494,8 +733,8 @@
     try { if (ytPlayer && ytPlayer.destroy) ytPlayer.destroy(); } catch { /* ignore */ }
     ytPlayer = null;
     ytState = null;
-    el.ytBox.innerHTML = '<div id="yt-target"></div>';
-    el.ytTarget = $('yt-target');
+    ytReady = false;
+    resetYtBox();
 
     ytPlayer = new YT.Player(el.ytTarget, {
       videoId: options.videoId,
@@ -505,44 +744,83 @@
         playsinline: 1,
         iv_load_policy: 3,
         enablejsapi: 1,
-        origin: window.location.origin
+        origin: window.location.origin,
+        vq: 'hd1080'
       },
       events: {
         onReady: (event) => {
+          ytReady = true;
           ytState = YT.PlayerState.UNSTARTED;
           suppressUntil = Date.now() + 1200;
           hideError();
           showLoading(false);
+          setStatus(expectedPlaying ? 'Sincronizado' : 'Listo', 'ok');
           try { event.target.setPlaybackRate(ytRate(options.rate || 1)); } catch { /* ignore */ }
+          try { if (event.target.setPlaybackQuality) event.target.setPlaybackQuality('hd1080'); } catch { /* ignore */ }
           if (options.position > 0) event.target.seekTo(options.position, true);
           if (options.playing) playLocal(); else event.target.pauseVideo();
+          resetYtWatch();
           reportPeer();
         },
         onStateChange: (event) => {
           ytState = event.data;
+
           if (event.data === YT.PlayerState.PLAYING) {
             started = true;
             clearTimeout(unlockWatch);
+            clearTimeout(ytPauseTimer);
             hide(el.unlock);
             showLoading(false);
             buffering = false;
+            bufferingSince = 0;
             reportPeer();
             updateOrb(true);
-            if (suppressed() && expectedPlaying) { /* eco del comando remoto */ }
-            else emitCommand('play', ytPlayer.getCurrentTime());
-          } else if (event.data === YT.PlayerState.PAUSED) {
+            try { if (ytPlayer.setPlaybackQuality) ytPlayer.setPlaybackQuality('hd1080'); } catch { /* ignore */ }
+
+            // Solo avisamos al servidor cuando la reproducción la inició
+            // una persona. Si venía de un tick/estado remoto, expectedPlaying
+            // ya es true y avisar otra vez solo genera eco.
+            if (!expectedPlaying && !isProgrammatic()) {
+              emitCommand('play', ytPlayer.getCurrentTime());
+            }
+            resetYtWatch();
+            return;
+          }
+
+          if (event.data === YT.PlayerState.PAUSED) {
             showLoading(false);
             buffering = false;
+            bufferingSince = 0;
             reportPeer();
             updateOrb(false);
-            if (suppressed() && !expectedPlaying) { /* eco del comando remoto */ }
-            else emitCommand('pause', ytPlayer.getCurrentTime());
-          } else if (event.data === YT.PlayerState.BUFFERING) {
+            resetYtWatch();
+
+            if (expectedPlaying && !isProgrammatic()) {
+              markLocalIntent(1600);
+              // Pequeño debounce: al arrastrar la barra YouTube a veces
+              // manda PAUSED y enseguida PLAYING. No queremos pausar a todos.
+              clearTimeout(ytPauseTimer);
+              ytPauseTimer = setTimeout(() => {
+                if (videoMode === 'youtube' && ytState === YT.PlayerState.PAUSED) {
+                  emitCommand('pause', ytPlayer.getCurrentTime());
+                }
+              }, 300);
+            }
+            return;
+          }
+
+          if (event.data === YT.PlayerState.BUFFERING) {
             buffering = true;
+            bufferingSince = bufferingSince || Date.now();
             showLoading(true, 'Buffering…');
             reportPeer();
-          } else if (event.data === YT.PlayerState.ENDED && !suppressed()) {
-            emitCommand('ended', ytPlayer.getCurrentTime());
+            if (!suppressed()) markLocalIntent(1200);
+            resetYtWatch();
+            return;
+          }
+
+          if (event.data === YT.PlayerState.ENDED && !isProgrammatic()) {
+            emitCommand('ended', 0);
           }
         },
         onError: (event) => {
@@ -562,7 +840,14 @@
   window.onYouTubeIframeAPIReady = function () {
     ytApiReady = true;
     if (pendingYt) {
-      const options = pendingYt;
+      // Refrescamos la posición: entre el click y la API lista puede
+      // haber pasado tiempo y el estado del servidor ya cambió.
+      const options = {
+        ...pendingYt,
+        position: computeTarget(latestPlayback),
+        playing: expectedPlaying,
+        rate: latestPlayback.rate || 1
+      };
       pendingYt = null;
       createYt(options);
     }
@@ -576,6 +861,7 @@
     if (videoMode === 'youtube') return;
     mediaReady = true;
     showLoading(false);
+    setStatus(expectedPlaying ? 'Sincronizado' : 'Listo', 'ok');
     if (pending) {
       suppressUntil = Date.now() + 800;
       if (pending.target > 0) setPosition(pending.target);
@@ -586,10 +872,24 @@
     reportPeer();
   });
 
-  el.video.addEventListener('canplay', () => { if (!el.video.ended) showLoading(false); });
+  el.video.addEventListener('canplay', () => {
+    buffering = false;
+    bufferingSince = 0;
+    if (!el.video.ended) showLoading(false);
+    // Si el servidor dice "reproduciendo" pero el video quedó pausado
+    // (por un stall o por una pausa del sistema), reintentamos acá.
+    if (expectedPlaying && el.video.paused && !el.video.ended &&
+        el.unlock.classList.contains('hidden')) {
+      suppressUntil = Date.now() + 700;
+      markProgrammatic(600);
+      safePlay();
+    }
+  });
+
   el.video.addEventListener('playing', () => {
     started = true;
     buffering = false;
+    bufferingSince = 0;
     hide(el.unlock);
     showLoading(false);
     reportPeer();
@@ -599,23 +899,53 @@
 
   el.video.addEventListener('waiting', () => {
     buffering = true;
+    bufferingSince = bufferingSince || Date.now();
     reportPeer();
     if (expectedPlaying || started) showLoading(true, 'Buffering…');
   });
 
-  // Si el evento local coincide con lo que ya mandó el servidor, es un eco:
-  // se ignora. Si la persona actuó justo después de un ajuste, se propaga.
+  el.video.addEventListener('stalled', () => {
+    buffering = true;
+    bufferingSince = bufferingSince || Date.now();
+    reportPeer();
+    if (expectedPlaying || started) showLoading(true, 'Buffering…');
+  });
+
+  el.video.addEventListener('seeking', () => {
+    // Ignoramos los seeks que provocamos nosotros al sincronizar.
+    if (isProgrammatic()) return;
+    markLocalSeek();
+  });
+
+  el.video.addEventListener('seeked', () => {
+    if (isProgrammatic()) return;
+    markLocalSeek();
+    emitCommand('seek', el.video.currentTime, { seek: true });
+  });
+
   el.video.addEventListener('play', () => {
-    if (suppressed() && expectedPlaying) return;
-    emitCommand('play');
+    // Si el servidor ya está en "playing", esto es el eco de nuestra
+    // propia sincronización, no una acción del usuario.
+    if (expectedPlaying || isProgrammatic()) return;
+    markLocalIntent(1500);
+    emitCommand('play', el.video.currentTime);
   });
+
   el.video.addEventListener('pause', () => {
-    if (suppressed() && !expectedPlaying) return;
-    emitCommand('pause');
+    if (!expectedPlaying || isProgrammatic()) return;
+    markLocalIntent(1500);
+    emitCommand('pause', el.video.currentTime);
   });
-  el.video.addEventListener('seeked', () => { if (!suppressed()) emitCommand('seek'); });
-  el.video.addEventListener('ratechange', () => { if (!suppressed() && !nudgeActive) emitCommand('rate'); });
-  el.video.addEventListener('ended', () => { if (!suppressed()) emitCommand('ended'); });
+
+  el.video.addEventListener('ratechange', () => {
+    if (suppressed() || nudgeActive || isProgrammatic()) return;
+    markLocalIntent(1200);
+    emitCommand('rate', el.video.currentTime, { rate: el.video.playbackRate });
+  });
+
+  el.video.addEventListener('ended', () => {
+    if (!isProgrammatic()) emitCommand('ended', 0);
+  });
 
   el.video.addEventListener('error', () => {
     if (!currentVideo || videoMode === 'youtube') return;
@@ -624,6 +954,41 @@
       ? 'El archivo no existe, no es compatible o el servidor no permite accederlo.'
       : 'No se pudo cargar el video. Probá con otro link.');
   });
+
+  // ------------------------------------------------------------
+  // Detector de seeks de YouTube (la API no expone "seeked")
+  // ------------------------------------------------------------
+  setInterval(() => {
+    if (videoMode !== 'youtube' || !ytPlayer || !window.YT || ytState === null) return;
+    if (ytState !== YT.PlayerState.PLAYING && ytState !== YT.PlayerState.PAUSED) {
+      resetYtWatch();
+      return;
+    }
+    if (suppressed() || isProgrammatic() || Date.now() < localIntentUntil || buffering) {
+      resetYtWatch();
+      return;
+    }
+
+    const pos = ytPlayer.getCurrentTime();
+    const now = Date.now();
+    if (!ytWatch.at) { resetYtWatch(); return; }
+
+    const elapsed = (now - ytWatch.at) / 1000;
+    const expectedMove = ytState === YT.PlayerState.PLAYING ? elapsed * getRate() : 0;
+    const jump = (pos - ytWatch.pos) - expectedMove;
+
+    if (Math.abs(jump) > 1.1 && now - ytWatch.lastSeekAt > 900) {
+      ytWatch.lastSeekAt = now;
+      lastLocalSeekAt = now;
+      markLocalIntent(1600);
+      emitCommand('seek', pos, { seek: true });
+      resetYtWatch();
+      return;
+    }
+
+    ytWatch.pos = pos;
+    ytWatch.at = now;
+  }, 500);
 
   // ------------------------------------------------------------
   // Usuarios / chat
@@ -653,6 +1018,7 @@
 
   function appendMessage(msg) {
     if (!msg) return;
+    const nearBottom = el.chatMessages.scrollHeight - el.chatMessages.scrollTop - el.chatMessages.clientHeight < 90;
     const div = document.createElement('div');
     const own = !msg.system && (msg.id === socket.id || (msg.name && msg.name === myName));
     div.className = 'chat-msg' + (msg.system ? ' system' : own ? ' own' : '');
@@ -669,13 +1035,14 @@
     }
     el.chatMessages.appendChild(div);
     while (el.chatMessages.children.length > 100) el.chatMessages.firstChild.remove();
-    el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+    if (nearBottom || own) el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
   }
 
   el.chatForm.addEventListener('submit', (event) => {
     event.preventDefault();
     const text = el.chatInput.value.trim();
     if (!text || !currentRoomId) return;
+    if (!socket.connected) { toast('Sin conexión. Tu mensaje no se envió.'); return; }
     socket.emit('chat:send', { text });
     el.chatInput.value = '';
   });
@@ -686,13 +1053,13 @@
   // Unirse / reconectar
   // ------------------------------------------------------------
   function saveJoin() {
-    if (joinInfo) {
-      try { sessionStorage.setItem(STORE_KEY, JSON.stringify(joinInfo)); } catch { /* ignore */ }
-    }
+    if (!joinInfo) return;
+    try { sessionStorage.setItem(STORE_KEY, JSON.stringify(joinInfo)); } catch { /* ignore */ }
   }
 
   function doJoin() {
-    if (joinInfo && socket.connected) socket.emit('room:join', joinInfo);
+    if (!joinInfo || !socket.connected) return;
+    socket.emit('room:join', { ...joinInfo, clientId });
   }
 
   const params = new URLSearchParams(window.location.search);
@@ -733,12 +1100,8 @@
 
   socket.on('connect', () => {
     hide(el.banner);
-    doJoin(); // también reingresa automáticamente después de un corte de red
-    if (currentRoomId) {
-      setStatus('Sincronizado', 'ok');
-      socket.emit('sync:request');
-      pulseOrb();
-    }
+    doJoin(); // también reingresa después de un corte de red
+    if (currentRoomId) setStatus('Reconectando…', 'warn');
   });
 
   socket.on('disconnect', () => {
@@ -754,9 +1117,11 @@
   });
 
   socket.on('room:joined', (state) => {
+    latestRevision = -1; // el servidor pudo haberse reiniciado
     currentRoomId = state.roomId;
     myId = state.you && state.you.id;
     isHost = !!(state.you && state.you.isHost);
+    myName = (state.you && state.you.name) || myName;
     joinInfo = { roomId: state.roomId, password: joinInfo ? joinInfo.password : '', name: myName };
     saveJoin();
 
@@ -767,18 +1132,27 @@
 
     hide(el.landing);
     show(el.room);
+    setStatus('Sincronizado', 'ok');
 
     el.chatMessages.innerHTML = '';
     (state.messages || []).forEach(appendMessage);
     applyState(state);
+    flushQueuedCommands();
     if (isHost) toast('Sos el anfitrión de la sala');
   });
 
   function applyState(state) {
-    if (state && Object.prototype.hasOwnProperty.call(state, 'video')) applySource(state.video, state.playback || latestPlayback);
-    else if (state && state.playback) applyPlayback(state.playback);
-    if (state && state.users) renderUsers(state.users);
-    if (state && state.playback) updateOrb(!!state.playback.playing);
+    if (!state) return;
+    if (Array.isArray(state.users)) renderUsers(state.users);
+    if (Object.prototype.hasOwnProperty.call(state, 'video')) {
+      applySource(state.video, state.playback || latestPlayback);
+    } else if (state.playback) {
+      applyPlayback(state.playback);
+    }
+    if (state.playback) {
+      updateOrb(!!state.playback.playing);
+      syncSpeedSelect(state.playback.rate);
+    }
   }
 
   socket.on('sync:state', (state) => {
@@ -798,7 +1172,7 @@
 
   socket.on('video:changed', (payload) => {
     applySource(payload.video, payload.playback || { position: 0, playing: false, rate: 1 });
-    toast((payload.by ? payload.by + ' cargó un video' : 'Nuevo video cargado'));
+    toast(payload.by ? payload.by + ' cargó un video' : 'Nuevo video cargado');
   });
 
   socket.on('users:update', (payload) => renderUsers(payload.users));
@@ -810,21 +1184,41 @@
   el.loadBtn.addEventListener('click', () => {
     const url = el.urlInput.value.trim();
     if (!url || !currentRoomId) return;
+    if (!socket.connected) { toast('Sin conexión. Esperá a reconectar.'); return; }
     socket.emit('video:set', { url });
     el.urlInput.value = '';
   });
+
   el.urlInput.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') el.loadBtn.click();
   });
+
   el.btnSync.addEventListener('click', () => {
+    localIntentUntil = 0;
+    suppressUntil = 0;
     socket.emit('sync:request');
     setStatus('Sincronizando…', 'warn');
     pulseOrb();
   });
+
   el.retry.addEventListener('click', () => {
+    localIntentUntil = 0;
+    suppressUntil = 0;
     if (currentVideo) applySource(currentVideo, latestPlayback, true);
   });
+
   el.errorCopy.addEventListener('click', () => copyText(currentVideo ? currentVideo.url : ''));
+  el.errorOpen.addEventListener('click', () => {
+    if (currentVideo && currentVideo.url) window.open(currentVideo.url, '_blank', 'noopener');
+  });
+
+  el.speed.addEventListener('change', () => {
+    const rate = Number(el.speed.value) || 1;
+    markLocalIntent(1500);
+    suppressUntil = Date.now() + 300;
+    setRate(rate);
+    emitCommand('rate', getPosition(), { rate });
+  });
 
   async function copyText(text) {
     if (!text) return;
@@ -851,9 +1245,10 @@
     window.location.href = window.location.pathname;
   });
 
-  // Pedir el estado al volver a la pestaña (los timers se frenan en background).
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && currentRoomId) {
+      localIntentUntil = 0;
+      suppressUntil = 0;
       socket.emit('sync:request');
       pulseOrb();
     }
@@ -875,7 +1270,7 @@
         if (document.documentElement.requestFullscreen) {
           await document.documentElement.requestFullscreen();
         } else if (el.video.webkitEnterFullscreen) {
-          el.video.webkitEnterFullscreen(); // fallback iOS
+          el.video.webkitEnterFullscreen();
         } else {
           setTheater(true);
           toast('Tu navegador no permite pantalla completa: usamos modo cine');
@@ -919,7 +1314,7 @@
   document.addEventListener('keydown', (event) => {
     const target = event.target || {};
     const tag = String(target.tagName || '').toLowerCase();
-    if (tag === 'input' || tag === 'textarea' || target.isContentEditable) return;
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || target.isContentEditable) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
 
     const key = event.key.toLowerCase();
@@ -933,17 +1328,38 @@
       event.preventDefault();
       el.video.muted = !el.video.muted;
       toast(el.video.muted ? 'Silenciado' : 'Audio activado');
-    } else if (event.code === 'Space' && currentRoomId) {
+    } else if (event.code === 'Space' && currentRoomId && tag !== 'button' && tag !== 'a') {
       event.preventDefault();
-      if (suppressed()) return;
+      if (isProgrammatic()) return;
+      markLocalIntent(1300);
       if (isPlayingLocally()) pauseLocal(); else playLocal();
     }
   });
 
   el.unlock.addEventListener('click', () => {
     hide(el.unlock);
+    markLocalIntent(1300);
     if (videoMode === 'youtube') safeYtPlay();
     else safePlay();
     setTimeout(reportPeer, 400);
+  });
+
+  // Diagnóstico liviano (consola del navegador):
+  //   __syncroomDebug()
+  window.__syncroomDebug = () => ({
+    room: currentRoomId,
+    name: myName,
+    clientId,
+    mode: videoMode,
+    youtubeState: ytState,
+    youtubeReady: ytReady,
+    ready: isReady(),
+    expectedPlaying,
+    playingNow: isPlayingLocally(),
+    buffering,
+    position: Number(getPosition().toFixed(2)),
+    rate: getRate(),
+    revision: latestRevision,
+    pending: pending ? { ...pending } : null
   });
 })();
