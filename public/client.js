@@ -14,7 +14,7 @@
   // ============================================================
 
   const $ = (id) => document.getElementById(id);
-  const BUILD = 'v5';
+  const BUILD = 'v6';
   const STORE_KEY = 'syncroom:join:v2';
   const CLIENT_KEY = 'syncroom:client:v1';
 
@@ -1435,7 +1435,13 @@
 
   el.unlock.addEventListener('click', () => {
     hide(el.unlock);
-    markLocalIntent(1300);
+    // Si la sala ya está reproduciendo, nos paramos en el punto actual
+    // antes de arrancar: así el viewer no empieza atrasado varios segundos.
+    if (latestPlayback && expectedPlaying) {
+      const target = computeTarget(latestPlayback);
+      if (Math.abs(getPosition() - target) > 1) setPosition(target);
+    }
+    markLocalIntent(900);
     if (videoMode === 'youtube') safeYtPlay();
     else safePlay();
     setTimeout(reportPeer, 400);
